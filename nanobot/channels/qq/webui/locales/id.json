@@ -19,6 +19,18 @@
         "label": "Pengguna diizinkan",
         "placeholder": "Open ID, dipisahkan koma"
       },
+      "groupAllowFrom": {
+        "label": "Grup yang diizinkan",
+        "placeholder": "Open ID grup, atau * untuk grup yang sudah terlihat"
+      },
+      "requireMention": { "label": "Balas hanya saat disebut" },
+      "httpTimeout": { "label": "Batas waktu HTTP (detik)" },
+      "slowAckSeconds": { "label": "Jeda tanda terima lambat (detik)" },
+      "slowAckTexts": { "label": "Teks tanda terima lambat" },
+      "senderNames": { "label": "Nama tampilan anggota" },
+      "groupContextDir": { "label": "Folder konteks grup" },
+      "groupContextMinutes": { "label": "Jendela konteks (menit)" },
+      "groupContextLimit": { "label": "Batas pesan konteks" },
       "msgFormat": {
         "label": "Format pesan",
         "choices": {

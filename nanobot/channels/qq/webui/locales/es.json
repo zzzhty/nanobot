@@ -19,6 +19,18 @@
         "label": "Usuarios permitidos",
         "placeholder": "Open ID separados por comas"
       },
+      "groupAllowFrom": {
+        "label": "Grupos permitidos",
+        "placeholder": "Open ID de grupo, o * para grupos ya vistos"
+      },
+      "requireMention": { "label": "Responder solo con mención" },
+      "httpTimeout": { "label": "Tiempo de espera HTTP (s)" },
+      "slowAckSeconds": { "label": "Retraso del acuse lento (s)" },
+      "slowAckTexts": { "label": "Textos del acuse lento" },
+      "senderNames": { "label": "Nombres de miembros" },
+      "groupContextDir": { "label": "Carpeta de contexto del grupo" },
+      "groupContextMinutes": { "label": "Ventana de contexto (min)" },
+      "groupContextLimit": { "label": "Límite de mensajes de contexto" },
       "msgFormat": {
         "label": "Formato de mensajes",
         "choices": {

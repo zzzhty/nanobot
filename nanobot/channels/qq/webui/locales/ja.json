@@ -19,6 +19,18 @@
         "label": "許可ユーザー",
         "placeholder": "Open ID（カンマ区切り）"
       },
+      "groupAllowFrom": {
+        "label": "許可するグループ",
+        "placeholder": "グループ Open ID。* は既に見たグループ"
+      },
+      "requireMention": { "label": "メンション時のみ返信" },
+      "httpTimeout": { "label": "HTTP タイムアウト（秒）" },
+      "slowAckSeconds": { "label": "遅い受領までの秒数" },
+      "slowAckTexts": { "label": "遅い受領の文面" },
+      "senderNames": { "label": "メンバー表示名" },
+      "groupContextDir": { "label": "グループ文脈の保存先" },
+      "groupContextMinutes": { "label": "文脈の窓（分）" },
+      "groupContextLimit": { "label": "文脈の件数" },
       "msgFormat": {
         "label": "メッセージ形式",
         "choices": {

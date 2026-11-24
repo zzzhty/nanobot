@@ -42,6 +42,12 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.outbound_events import ContextCompactionEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.qq.group_context import GroupContextEntry, GroupContextLog
+from nanobot.channels.qq.group_events import (
+    GroupEventDecision,
+    consume_plain_group_message,
+    install_group_message_parser,
+)
 from nanobot.config_base import Base
 from nanobot.security.network import validate_url_target
 from nanobot.utils.logging_bridge import redirect_lib_logging
@@ -114,6 +120,17 @@ def _is_network_error(exc: BaseException) -> bool:
     )
 
 
+def _msgid_expired(exc: BaseException) -> bool:
+    text = str(exc)
+    if "40034031" in text:
+        return True
+    lowered = text.lower()
+    return "过期" in text or "expired" in lowered
+
+
+_EMPTY_MENTION = "[有人只 @ 了你，没有写其他文字]"
+
+
 def _make_bot_class(channel: QQChannel) -> type[Any]:
     botpy_sdk = cast(Any, botpy)
     intents = botpy_sdk.Intents(public_messages=True, direct_message=True)
@@ -123,6 +140,7 @@ def _make_bot_class(channel: QQChannel) -> type[Any]:
             # Disable botpy's file log — nanobot uses loguru; default "botpy.log" fails on read-only fs
             super().__init__(  # pyright: ignore[reportUnknownMemberType]
                 intents=intents,
+                timeout=channel._http_timeout(),
                 ext_handlers=False,
             )
             self._ws_backoff: dict[int, int] = {}
@@ -286,7 +304,18 @@ class QQConfig(Base):
     app_id: str = ""
     secret: str = ""
     allow_from: list[str] = Field(default_factory=list)
+    # Groups listed here are authorized as a chat. "*" allows groups this
+    # process has already seen, and does not allow direct messages.
+    group_allow_from: list[str] = Field(default_factory=list)
     msg_format: Literal["plain", "markdown"] = "plain"
+    require_mention: bool = True
+    http_timeout: float = 60
+    slow_ack_seconds: float = 0
+    slow_ack_texts: list[str] = Field(default_factory=list)
+    sender_names: dict[str, str] = Field(default_factory=dict)
+    group_context_dir: str = ""
+    group_context_minutes: int = 120
+    group_context_limit: int = 40
     ack_message: str = "⏳ Processing..."
 
     # Optional: directory to save inbound attachments. If empty, use nanobot get_media_dir("qq").
@@ -326,6 +355,9 @@ class QQChannel(BaseChannel):
         self._processed_ids: deque[str] = deque(maxlen=1000)
         self._msg_seq: int = 1  # used to avoid QQ API dedup
         self._chat_type_cache: dict[str, str] = {}
+        self._known_group_ids: set[str] = set()
+        self._group_context: GroupContextLog | None = None
+        self._group_context_disabled = False
 
         _install_qq_payload_capture()
 
@@ -346,6 +378,152 @@ class QQChannel(BaseChannel):
         root.mkdir(parents=True, exist_ok=True)
         self.logger.info("media directory: {}", str(root))
         return root
+
+    def is_allowed(self, sender_id: str) -> bool:
+        """Allow a configured group id without treating that list as DM allowlist."""
+        groups = self._group_allow_tokens()
+        if sender_id in groups:
+            return True
+        if "*" in groups and sender_id in self._known_group_ids:
+            return True
+        return super().is_allowed(sender_id)
+
+    def _group_allow_tokens(self) -> list[str]:
+        raw = self.config.group_allow_from
+        return [str(item).strip() for item in raw if str(item).strip()]
+
+    def _group_authorizes(self, chat_id: str) -> bool:
+        groups = self._group_allow_tokens()
+        return chat_id in groups or "*" in groups
+
+    def _http_timeout(self) -> float:
+        raw = os.environ.get("QQ_HTTP_TIMEOUT")
+        if raw:
+            try:
+                value = float(raw)
+            except ValueError:
+                value = 0
+            if value > 0:
+                return value
+        return self.config.http_timeout if self.config.http_timeout > 0 else 60.0
+
+    def _mention_required(self) -> bool:
+        raw = os.environ.get("QQ_GROUP_REQUIRE_MENTION")
+        if raw is None:
+            return self.config.require_mention
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+    def _slow_ack_metadata(self) -> dict[str, Any]:
+        seconds = self.config.slow_ack_seconds
+        raw_seconds = os.environ.get("QQ_SLOW_ACK_SECONDS")
+        if raw_seconds:
+            try:
+                seconds = float(raw_seconds)
+            except ValueError:
+                seconds = 0
+        texts = [text.strip() for text in self.config.slow_ack_texts if text.strip()]
+        raw_texts = os.environ.get("QQ_SLOW_ACK_TEXTS")
+        if raw_texts:
+            texts = [part.strip() for part in raw_texts.split("|") if part.strip()]
+        if seconds <= 0 or not texts:
+            return {}
+        return {"slow_ack_seconds": seconds, "slow_ack_texts": texts}
+
+    def _context_enabled_for(self, chat_id: str) -> bool:
+        groups = self._group_allow_tokens()
+        if not groups:
+            return False
+        return "*" in groups or chat_id in groups
+
+    def _context_log(self) -> GroupContextLog | None:
+        if self._group_context_disabled:
+            return None
+        if self._group_context is not None:
+            return self._group_context
+        try:
+            if self.config.group_context_dir:
+                root = Path(self.config.group_context_dir).expanduser()
+            else:
+                from nanobot.config.paths import get_data_dir
+
+                root = get_data_dir() / "qq-group-context"
+            self._group_context = GroupContextLog(
+                root,
+                minutes=self.config.group_context_minutes,
+                limit=self.config.group_context_limit,
+                sender_names=self.config.sender_names,
+            )
+        except OSError:
+            self._group_context_disabled = True
+            self.logger.warning("QQ group context is unavailable")
+            return None
+        return self._group_context
+
+    def _remember_ambient_group_message(self, decision: GroupEventDecision) -> None:
+        if decision.dispatch or not decision.chat_id or not self._context_enabled_for(decision.chat_id):
+            return
+        self._known_group_ids.add(decision.chat_id)
+        self._record_group_line(
+            decision.chat_id,
+            decision.message_id,
+            decision.sender_id,
+            decision.raw_content,
+            at_bot=decision.at_bot,
+            attachment_count=decision.attachment_count,
+        )
+
+    def _record_group_line(
+        self,
+        chat_id: str,
+        message_id: str,
+        sender_id: str,
+        content: str,
+        *,
+        at_bot: bool,
+        attachment_count: int,
+    ) -> None:
+        log = self._context_log()
+        if log is None:
+            return
+        try:
+            log.record(
+                GroupContextEntry(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    sender_id=sender_id,
+                    content=content,
+                    at_bot=at_bot,
+                    created=log.clock(),
+                    attachment_count=attachment_count,
+                )
+            )
+        except Exception:
+            self.logger.debug("QQ group context record failed")
+
+    def _prepend_group_context(self, chat_id: str, message_id: str, content: str) -> str:
+        if content.startswith("/"):
+            return content
+        log = self._context_log()
+        if log is None:
+            return content
+        try:
+            block = log.context_block(chat_id, exclude_message_id=message_id)
+        except Exception:
+            self.logger.debug("QQ group context read failed")
+            return content
+        if not block:
+            return content
+        return f"{block}\n\n{content}"
+
+    def _outbound_target(self, chat_id: str) -> tuple[str, bool]:
+        bare = chat_id.removeprefix("qq:") if chat_id.startswith("qq:") else chat_id
+        cached = self._chat_type_cache.get(bare)
+        if cached == "group":
+            return bare, True
+        if cached == "c2c":
+            return bare, False
+        groups = [item for item in self._group_allow_tokens() if item != "*"]
+        return bare, bare in groups
 
     async def login(self, force: bool = False) -> bool:
         """Scan a QQ Bot QR code and save the AppID/secret it returns."""
@@ -372,6 +550,11 @@ class QQChannel(BaseChannel):
 
         self._running = True
         self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
+        if QQ_AVAILABLE:
+            install_group_message_parser(
+                self._remember_ambient_group_message,
+                require_mention=self._mention_required,
+            )
 
         self._client = _make_bot_class(self)()
         self.logger.info("bot started (C2C & Group supported)")
@@ -421,47 +604,65 @@ class QQChannel(BaseChannel):
         ):
             return
 
+        chat_id, is_group = self._outbound_target(msg.chat_id)
+        route = "group" if is_group else "c2c"
+        length = len((msg.content or "").strip())
+        raw_id = msg.metadata.get("message_id")
+        msg_id = raw_id if isinstance(raw_id, str) and raw_id else None
         try:
-            if not self._client:
-                raise ChannelNotReadyError("QQ client not initialized")
+            await self._deliver(chat_id, is_group, msg_id, msg)
+        except Exception as exc:
+            if msg_id and _msgid_expired(exc):
+                self.logger.info("QQ reply window expired; retrying without message id")
+                await self._deliver(chat_id, is_group, None, msg)
+                return
+            if isinstance(exc, (aiohttp.ClientError, OSError)):
+                raise
+            self.logger.error(
+                "QQ send failed route={} length={} error={}",
+                route,
+                length,
+                type(exc).__name__,
+            )
+            raise
 
-            msg_id = msg.metadata.get("message_id")
-            chat_type = self._chat_type_cache.get(msg.chat_id, "c2c")
-            is_group = chat_type == "group"
+    async def _deliver(
+        self,
+        chat_id: str,
+        is_group: bool,
+        msg_id: str | None,
+        msg: OutboundMessage,
+    ) -> None:
+        if not self._client:
+            raise ChannelNotReadyError("QQ client not initialized")
 
-            for media_ref in msg.media or []:
-                ok = await self._send_media(
-                    chat_id=msg.chat_id,
-                    media_ref=media_ref,
-                    msg_id=msg_id,
-                    is_group=is_group,
+        for media_ref in msg.media or []:
+            ok = await self._send_media(
+                chat_id=chat_id,
+                media_ref=media_ref,
+                msg_id=msg_id,
+                is_group=is_group,
+            )
+            if not ok:
+                filename = (
+                    os.path.basename(urlparse(media_ref).path)
+                    or os.path.basename(media_ref)
+                    or "file"
                 )
-                if not ok:
-                    filename = (
-                        os.path.basename(urlparse(media_ref).path)
-                        or os.path.basename(media_ref)
-                        or "file"
-                    )
-                    await self._send_text_only(
-                        chat_id=msg.chat_id,
-                        is_group=is_group,
-                        msg_id=msg_id,
-                        content=f"[Attachment send failed: {filename}]",
-                    )
-
-            if msg.content and msg.content.strip():
                 await self._send_text_only(
-                    chat_id=msg.chat_id,
+                    chat_id=chat_id,
                     is_group=is_group,
                     msg_id=msg_id,
-                    content=msg.content.strip(),
+                    content=f"[Attachment send failed: {filename}]",
                 )
-        except (aiohttp.ClientError, OSError):
-            # Network / transport errors — propagate so ChannelManager can retry
-            raise
-        except Exception:
-            self.logger.exception("Error sending message to chat_id={}", msg.chat_id)
-            raise
+
+        if msg.content and msg.content.strip():
+            await self._send_text_only(
+                chat_id=chat_id,
+                is_group=is_group,
+                msg_id=msg_id,
+                content=msg.content.strip(),
+            )
 
     async def _send_text_only(
         self,
@@ -665,18 +866,28 @@ class QQChannel(BaseChannel):
                 return
             self._processed_ids.append(message_id)
             self._chat_type_cache[chat_id] = chat_type
+            if is_group:
+                self._known_group_ids.add(chat_id)
 
             # Early permission check — avoid attachment downloads and ack side effects
             # for unauthorized users. C2C messages can receive pairing codes;
-            # group messages remain silently ignored.
-            if not self.is_allowed(user_id):
-                if not is_group:
-                    await self._handle_message(
-                        sender_id=user_id,
-                        chat_id=chat_id,
-                        content="",
-                        is_dm=True,
-                    )
+            # group messages remain silently ignored. A listed group authorizes
+            # the chat itself; a sender allowlist keeps the previous behavior.
+            authorization_id: str | None = None
+            if is_group:
+                group_ok = self._group_authorizes(chat_id)
+                user_ok = BaseChannel.is_allowed(self, user_id)
+                if not group_ok and not user_ok:
+                    return
+                if group_ok and not user_ok:
+                    authorization_id = chat_id
+            elif not self.is_allowed(user_id):
+                await self._handle_message(
+                    sender_id=user_id,
+                    chat_id=chat_id,
+                    content="",
+                    is_dm=True,
+                )
                 return
 
             # Resolve the quote before attachment downloads let newer messages
@@ -703,8 +914,25 @@ class QQChannel(BaseChannel):
                     f"{content}\n\n{file_block}".strip() if content else f"{tag}\n{file_block}"
                 )
 
+            if is_group and not content and not media_paths:
+                if consume_plain_group_message(message_id):
+                    return
+                content = _EMPTY_MENTION
+
             if not content and not media_paths:
                 return
+
+            raw_content = content
+            if is_group and self._context_enabled_for(chat_id):
+                content = self._prepend_group_context(chat_id, message_id, content)
+                self._record_group_line(
+                    chat_id,
+                    message_id,
+                    user_id,
+                    raw_content,
+                    at_bot=True,
+                    attachment_count=len(attachments),
+                )
 
             if self.config.ack_message:
                 try:
@@ -715,18 +943,24 @@ class QQChannel(BaseChannel):
                         content=self.config.ack_message,
                     )
                 except Exception:
-                    self.logger.debug("ack message failed for chat_id={}", chat_id)
+                    self.logger.debug("ack message failed")
 
+            metadata: dict[str, Any] = {
+                "message_id": message_id,
+                "attachments": att_meta,
+                "chat_type": chat_type,
+                "raw_content": raw_content,
+            }
+            if is_group:
+                metadata.update(self._slow_ack_metadata())
             await self._handle_message(
                 sender_id=user_id,
                 chat_id=chat_id,
                 content=content,
                 media=media_paths if media_paths else None,
-                metadata={
-                    "message_id": message_id,
-                    "attachments": att_meta,
-                },
+                metadata=metadata,
                 is_dm=not is_group,
+                authorization_id=authorization_id,
             )
         except Exception:
             self.logger.exception(
