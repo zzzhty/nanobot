@@ -124,8 +124,9 @@ def _soft_prompt(waited: float, extend: float) -> str:
     extend_text = _span(extend)
     return (
         f"已经等了 {waited_text}，这条请求可能还在生成。我没有把它当成失败，也没有重新发送。"
-        f"发送 /image-wait 再观察同一条请求 {extend_text}。发送 /image-retry 会重新生成，原来的请求可能已经计费。"
-        f"如果 {extend_text}内不选择，我将停止观察，之后不能再等回结果。"
+        f"直接说再等 {extend_text}，我会继续看同一条请求，不会重新生图。"
+        f"重新生成是另一次请求，原来的可能已经计费。"
+        f"如果 {extend_text}内不说，我将停止观察，之后不能再等回结果。"
     )
 
 
@@ -373,7 +374,7 @@ class ImageQueue:
             lines.extend((
                 f"Image queue in this conversation: {', '.join(states)}.",
                 "If the current input adds or changes image requirements, use generate_image status and update the full draft. If clarification is needed, hold the draft with defer before asking.",
-                "Do not queue a new image for unrelated chat. A running image cannot be changed. Do not call the provider again for an unconfirmed call. Only the user can send /image-wait or /image-retry; do not send either yourself.",
+                "Do not queue a new image for unrelated chat. A running image cannot be changed. Do not call the provider again for an unconfirmed call. If the user asks to keep waiting, call generate_image with queue_mode=wait. That keeps the same provider call and does not generate again. Do not send /image-wait yourself.",
             ))
         if undelivered:
             lines.append(
@@ -591,10 +592,14 @@ class ImageQueue:
             row.update({name: value for name, value in params.items() if name != "reference_images"})
             visible.append(row)
         unresolved = sum(str(item["id"]) not in self.inputs for item in held)
+        can_wait = key in self.workers and any(
+            item["state"] == "running" and item["cancelled"] == 0 for item in visible
+        )
         return {
             "jobs": visible,
             "unconfirmed_call": paused,
             "unresolved_inputs": unresolved,
+            "can_wait": can_wait,
         }
 
     def recovery(self, record: Input, generation: str, mode: str) -> str:
@@ -1532,6 +1537,8 @@ async def handle_image_request(
     try:
         if mode == "status":
             return json.dumps(queue.status(record.key, generation), ensure_ascii=False)
+        if mode == "wait":
+            return queue.choose_wait(record.key, generation)
         if mode == "defer":
             return queue.defer(record, generation)
         if mode == "recover":

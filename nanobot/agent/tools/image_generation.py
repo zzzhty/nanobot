@@ -110,11 +110,12 @@ def _queue_parameters() -> dict[str, Any]:
     properties = schema["properties"]
     properties["queue_mode"] = StringSchema(
         "For the gateway queue: status to inspect drafts; merge (default) with a full updated brief; "
-        "new for a separate image; recover to read interrupted inputs; defer to hold a draft for clarification. "
-        "An unconfirmed provider call is not retried and does not block a later draft. "
-        "Only the user can send /image-wait to keep observing that same request, "
-        "or /image-retry to start a separate attempt.",
-        enum=["status", "merge", "new", "recover", "defer"],
+        "new for a separate image; recover to read interrupted inputs; defer to hold a draft for clarification; "
+        "wait to keep observing the same running provider call. "
+        "wait does not generate again and does not start a billed retry. "
+        "status.can_wait is false when that call has finished, was cancelled, or the process restarted. "
+        "An unconfirmed provider call is not retried and does not block a later draft.",
+        enum=["status", "merge", "new", "recover", "defer", "wait"],
     ).to_json_schema()
     properties["draft_id"] = StringSchema(
         "ID from status. A draft is edited; a frozen image may seed the next draft.",
@@ -172,7 +173,8 @@ class ImageGenerationTool(Tool):
                 "Queue image generation for the current interactive QQ or WebUI turn. "
                 "The gateway delivers those results later. On every other turn, generate the image immediately. "
                 "Use status before modifying a pending image. Do not claim completion or submit twice. "
-                "Use new only for a separate request."
+                "Use new only for a separate request. "
+                "If the user asks to keep waiting for an image that is already running, use queue_mode=wait."
             )
         return (
             "Generate or edit images as persistent artifacts. Returns artifact IDs and local paths."
