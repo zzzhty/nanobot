@@ -316,6 +316,11 @@ class TurnDelivery:
     def record_usage(self, round_usages: list[LLMUsage]) -> None:
         self.runtime_event_publisher.record_turn_usage(self.session_key, round_usages, run_id=self.run_id)
 
+    @property
+    def stop_reason(self) -> str | None:
+        """Stop reason recorded for the turn, when the runner has finished."""
+        return self._stop_reason
+
     def record_stop_reason(
         self,
         stop_reason: str,

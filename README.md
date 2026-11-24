@@ -1,3 +1,85 @@
+> [!WARNING]
+> **这是非官方 fork，不是 [HKUDS/nanobot](https://github.com/HKUDS/nanobot) 的发布版本。** 仓库名仍是 nanobot，许可证仍是 MIT，上游版权保留。这里的行为只存在于 [zzzhty/nanobot](https://github.com/zzzhty/nanobot)。不要把这些改动当成官方功能，也不要向上游提交本 fork 的拉取请求。
+
+## 本 fork
+
+本页文首说明本 fork 相对上游的实际改动。下面从封面图开始的英文文档是上游安装与使用说明，原样保留；其中的安装命令安装的是官方包，不包含本 fork。
+
+### 上游基线
+
+本 fork 的 `main` 在接入这些改动之前，与上游提交 `78a3c38375477da9f192fa386322e1920a06cb35` 相同。该提交的包版本号是 `0.4.2`，提交说明为 `fix(session): preserve the timezone of newly admitted inputs (#6780)`，时间是 2026-11-24。改动是按这份源码接入的，没有把 `main` 回退到旧的 wheel 锚点。上游 `main` 会继续前进，本 fork 不会自动跟上。
+
+### 相对官方已经进源码的行为
+
+QQ 群消息会在进程内补上 qq-botpy 1.2.x 没有的 `parse_group_message_create`，再交给现有的 @ 消息处理。默认只有 @ 机器人才进入回复；`channels.qq.requireMention` 或环境变量 `QQ_GROUP_REQUIRE_MENTION=0` 可以放行未 @ 的群消息。运行时不再需要替换 nanobot 的 site-packages。
+
+`channels.qq.groupAllowFrom` 按群授权。群本身在名单里、发消息的人却不在 `allowFrom` 里时，这一次授权使用群的 chat id。发消息的人已经在 `allowFrom` 里时，授权方式与官方一致。`"*"` 只放行本进程已经见过的群，不放行私聊。把某个具体群 id 写进名单后，`is_allowed` 会把这个 id 当成已授权；如果私聊碰巧使用同一个 id，也会被当成已授权。
+
+已授权群会保留最近 120 分钟、最多 40 条文本，用作后续消息的上下文。这里不保存附件内容。以 `/` 开头的文本不会被上下文挡住，`/stop` 和 `/new` 读取 QQ 消息的原文。只有 @、没有其他文字时，进入会话的内容是 `[有人只 @ 了你，没有写其他文字]`。未 @ 的空消息会被丢掉。私聊的空消息仍按官方逻辑丢弃。群上下文只在 `groupAllowFrom` 非空、且该群被名单或 `"*"` 覆盖时启用。
+
+出站会去掉开头的 `qq:` 前缀。已经见过的会话按群或私聊发送；还没见过、但 id 明确写在 `groupAllowFrom` 里的目标按群发送，避免定时消息打到私聊接口后 404。`"*"` 不能单独把未知 id 判成群。缓存里的私聊优先于名单。QQ HTTP 超时默认 60 秒，可用 `channels.qq.httpTimeout` 或 `QQ_HTTP_TIMEOUT` 修改。引用的 msgid 过期时会去掉 msgid 再发一次。发送失败日志只保留路由、长度和异常类型。
+
+新的 QQ 私聊或群会话，如果还没有保存过模型 preset，会使用 `QQ_PRESET_DM`、`QQ_PRESET_GROUP`，两者都没有时使用进程当前的 model preset。已有选择不会被覆盖。设置失败不会中断这一轮。QQ 默认不把压缩提示发到聊天里，这是上游已有行为，本 fork 没有再加静音开关。上游已经支持的 DeepSeek 多模态也没有重复实现。
+
+慢回执默认关闭。群消息可以配置 `channels.qq.slowAckSeconds` 和 `channels.qq.slowAckTexts`，或使用 `QQ_SLOW_ACK_SECONDS` 与用 `|` 分隔的 `QQ_SLOW_ACK_TEXTS`。回合先结束时，这条回执会被取消。没有文案时保持沉默。
+
+QQ 的最终答复只在本回合、同一目标、正常完成、且文本与 `message` 工具已经发出的内容完全一致时隐藏。其他渠道仍使用上游规则。发往另一个会话，或这次发送带了媒体时，会把这次发送记入目标会话。`message` 工具在比较目标前会去掉 QQ 的 `qq:` 前缀。
+
+生图队列登记过的输入不会并进当前回合。其他图片后续消息仍按上游方式注入。`tools.imageGeneration.persistentQueue` 或 `NANOBOT_IMAGE_QUEUE=1` 打开持久生图队列，并且当前工具里要有 `generate_image`。队列默认关闭；关闭时生图仍是官方的同步调用。打开后，只有当前的 QQ 或 WebUI 回合进入队列，草稿按 FIFO 合并或新建，结果在回合结束后由网关发出。其他渠道和自动化回合仍立即生图。跨会话发送的内部记录标记会在进入出站队列前去掉，避免写进渠道载荷。`/stop` 取消该会话的队列任务和草稿，并清掉提示词；正在进行或未确认的调用不再投递，也不会挡住后面的草稿。进程关闭或再次启动时，仍在 running 的调用标成 unknown，不会自动重试。`/image-resume` 确认 unknown 并清掉未处理追加，它不是继续生图的前提，也不是一条会进入模型的普通命令。`/image-wait` 和 `/image-retry` 由队列直接回复，必须整条匹配，不会进入模型。`/stop` 和 `/new` 不会被队列吞掉。队列保存的是用户原文，QQ 上优先使用去掉上下文前缀之前的文本。
+
+同一会话同时只有一个 provider 调用。草稿在调用前于一次 SQLite 事务里冻成 running。默认先观察 180 秒，到点后同一条调用继续跑，向原会话主动发送提示，并自动再观察一段决定时间，默认 300 秒（`watch_extend`）。这是内部时限，用户不必说「五分钟」。用户用平常的话让 agent 再等时，agent 调用已有的 `generate_image`，`queue_mode=wait`，从当时起把同一条仍在跑的请求再观察一个 `watch_extend`，不重新生图；再调用一次不会再延长，也不会重新发送。模型不一定听懂。精确的 `/image-wait` 不经过模型，效果相同。决定时间内没有再等，或这次延长结束后仍没有结果，就停止观察并记为 unknown，不再接收这次的迟到结果，也不自动重试。一次调用因此最多经过首次 180 秒、这段自动决定时间和用户再等的一次窗口，不会无限挂住。服务端明确返回失败时记为 failed，说明原因，并让用户直接说要不要重试。超时、断线和没有确认结果的异常记为 unknown，不说成失败，并说明原来的连接不能恢复、原来的请求可能已经计费。用户表示要新的一次时，agent 调用 `queue_mode=retry`，才会新开一次独立请求；重复调用不会再开一次。精确的 `/image-retry` 效果相同。`/stop` 取消该会话正在观察的任务，草稿和 unknown 变为 cancelled。本地取消不能强制终止服务端，已经发出的请求可能仍会计费，但窗口结束、`/stop` 或重新生成之后返回的结果不会投递，也不会记到新的尝试上。结果投递失败保留路径并把 `delivery_error` 标成 1；提示或命令回复投递失败把 `prompt_error` 标成 1，都不因此重新调用 provider。其他会话照常开始。`status` 里的 `unconfirmed_call` 只表示有一条未确认调用。`defer` 是在等用户补充说明，可以用合并修订或 `/stop` 结束。没有当时的故障日志，不能把这些路径说成某一次历史卡死的根因。
+
+仍不能保证的边界：provider 若卡在同步代码里不交还事件循环，整个进程会停在那次调用里，软超时提示发不出去。provider 若吞掉取消后继续不返回，观察窗口结束后会放行后续草稿，但停不掉已经发出的请求，它可能仍被计费。进程重启后原来的连接不能恢复，因为这些 provider 没有任务查询接口；`/image-wait` 和 `queue_mode=wait` 不会假装还能取回那次结果。已经成功返回、但还没送达的图，在 `/stop` 之后仍可能再尝试投递一次。若投递已经写到渠道但进程在记下 notice 之前退出，重启后可能再发一次聊天消息，不会再调用 provider。聊天投递失败后，用户可能看不到那条消息，`status` 里仍有 `delivery_error` 或 `prompt_error`。队列文件损坏时，这一次状态可能读不出来。回合若没有正常结束，inbox 里的 hold 会留到 `/stop` 或 `/image-resume`。非 QQ、非 WebUI 和自动化回合不进这条队列，仍按上游同步生图。普通聊天不会被队列当成命令。要再等或重试，得由 agent 调用 `queue_mode=wait` 或 `queue_mode=retry`，或用户发送精确的 `/image-wait`、`/image-retry`。用户不必说固定的五分钟，也不必背这些命令。不能据此认为每个模型都会听懂。
+
+### 安装本 fork
+
+克隆 <https://github.com/zzzhty/nanobot.git>，检出包含本段说明的提交。合并到该仓库 `main` 之前，集成分支是 `cursor/integrate-qq-fork-patches-eb96`。合并之后改用 `main` 上的合并提交，并把提交号固定下来。
+
+```bash
+git clone https://github.com/zzzhty/nanobot.git
+cd nanobot
+git checkout cursor/integrate-qq-fork-patches-eb96
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+nanobot plugins enable qq
+```
+
+已知完整提交号时也可以：
+
+```bash
+python -m pip install "nanobot-ai @ git+https://github.com/zzzhty/nanobot.git@<commit>"
+```
+
+把 `<commit>` 换成本 fork 的完整提交号。QQ 频道依赖 `qq-botpy>=1.2.0,<2.0.0`，由 `nanobot plugins enable qq` 安装。本 fork 在当前 1.2.1 上验证过进程内群事件注册。
+
+### 与官方安装方式的差异
+
+下面「Install」里的 `install.sh`、`install.ps1`、`uv tool install nanobot-ai` 和 `pip install nanobot-ai` 都安装 HKUDS 发布的官方包。从 HKUDS/nanobot 克隆源码也同样不是本 fork。本 fork 没有修改官方包名 `nanobot-ai`，所以同名安装会互相覆盖；要使用这里的行为，必须从 zzzhty/nanobot 的提交安装。
+
+### 仍然留在 nanobot 之外的部分
+
+本 fork 不修改 qq-botpy 的安装文件，也没有另一个 qq-botpy fork。群消息入口依赖 qq-botpy 在创建连接时扫描 `parse_*` 方法。当前库没有 `parse_group_message_create`，所以本进程会补上。如果将来的库自己提供了这个方法，本 fork 不会覆盖它。如果将来的库不再按这个方法发现事件，未 @ 的群消息就不会进入；官方的 @ 事件 `group_at_message_create` 仍然可用。
+
+当前 qq-botpy 的未知事件日志只写事件名，不写载荷。本 fork 没有再包一层未知事件脱敏，也不声称修过一条载荷泄漏。
+
+完整的旁路消息归档、未 @ 消息的附件下载、systemd 单元和巡检脚本都不在 nanobot 里。本 fork 只保留有长度和时间窗口的群上下文。这些外部脚本不能靠安装本 fork 恢复。
+
+### 升级与回归
+
+同步上游时，以当时的 zzzhty/nanobot `main` 为基线，不要为了旧补丁锚点降级。同步后运行离线回归，确认行为在源码里，而不是确认补丁脚本还能打上。这些测试使用假 provider，不连接 QQ：
+
+```bash
+python -m pytest tests/channels/test_qq_fork_behavior.py tests/agent/test_qq_fork_behavior.py tests/agent/test_image_queue.py tests/tools/test_message_tool.py tests/tools/test_message_tool_suppress.py nanobot/channels/qq/tests
+python -m scripts.check_import_boundaries
+ruff check nanobot tests
+basedpyright
+```
+
+重点看群与私聊授权是否隔离、出站群/私聊路由、最终答复去重，以及生图队列的 FIFO、取消、关闭后恢复和 `/stop`、`/new`。上游已经覆盖的压缩提示与多模态不要再接回来。
+
+新增代码与本仓库一样使用 MIT 许可证。`LICENSE` 里的上游版权声明保持不变。
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./images/readme-cover-dark.svg">
   <img alt="nanobot README cover" src="./images/readme-cover-light.svg">
@@ -57,6 +139,8 @@
 | Run nanobot continuously or on a server | [Deploy](#-deploy) · [Deployment Guide](./docs/deployment.md) |
 | Embed nanobot in Python | [Python SDK](./docs/python-sdk.md) |
 | Contribute or extend nanobot | [Architecture](./docs/architecture.md) · [Contributing](./CONTRIBUTING.md) |
+
+> 本 fork 的安装方式在文首「安装本 fork」。本节命令安装的是 HKUDS 官方 nanobot，不包含上面的 QQ 与生图队列改动。
 
 ## 📦 Install
 

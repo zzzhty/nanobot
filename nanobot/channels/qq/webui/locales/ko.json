@@ -19,6 +19,18 @@
         "label": "허용 사용자",
         "placeholder": "Open ID, 쉼표로 구분"
       },
+      "groupAllowFrom": {
+        "label": "허용할 그룹",
+        "placeholder": "그룹 Open ID. * 는 이미 본 그룹"
+      },
+      "requireMention": { "label": "멘션될 때만 응답" },
+      "httpTimeout": { "label": "HTTP 제한 시간(초)" },
+      "slowAckSeconds": { "label": "느린 수신 지연(초)" },
+      "slowAckTexts": { "label": "느린 수신 문구" },
+      "senderNames": { "label": "멤버 표시 이름" },
+      "groupContextDir": { "label": "그룹 문맥 디렉터리" },
+      "groupContextMinutes": { "label": "문맥 창(분)" },
+      "groupContextLimit": { "label": "문맥 개수" },
       "msgFormat": {
         "label": "메시지 형식",
         "choices": {

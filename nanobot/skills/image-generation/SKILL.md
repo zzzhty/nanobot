@@ -17,6 +17,10 @@ If the `generate_image` tool is not available in the current tool list, tell the
 - Ambiguous edits: ask a short clarifying question if multiple recent images could be the target.
 - After generating images, call the `message` tool with the artifact paths in the `media` parameter to deliver them to the user.
 
+## Gateway Queue
+
+Follow this section only when the `generate_image` description says the gateway queues the image. Call `queue_mode=status` before changing a draft. `merge` replaces the full brief, `new` starts a separate image, and `defer` holds the draft until the user answers, sends `/stop`, or the draft is revised. `recover` reads an interrupted input. Do not submit an unconfirmed or still-running provider call again. If the user asks to keep waiting, call `queue_mode=wait`; that observes the same provider call and does not generate again. The user does not have to name a duration. `status.can_wait` is false when the call is no longer running. If the user asks to try again after a failure or an unknown result, call `queue_mode=retry`. That starts one new attempt and does not recover the original connection; tell the user an unknown or still-running original may already have been billed. A separate image is `new`. `/image-resume` acknowledges an unconfirmed call and drops leftover holds. Do not send slash commands yourself. Do not submit the same input twice. The gateway sends the finished image later; do not claim that it is finished in the current turn. `/stop` and `/new` remain commands.
+
 ## Prompt Rules
 
 Write prompts with enough detail for image models:

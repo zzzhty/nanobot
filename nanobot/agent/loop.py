@@ -24,16 +24,18 @@ from nanobot.agent.context import ContextBuilder, PersistedPromptContextResolver
 from nanobot.agent.cron_turns import CronTurnCoordinator
 from nanobot.agent.execution_policy import ExecutionControlError, ExecutionPolicy, ExecutionScope
 from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
+from nanobot.agent.image_queue import ImageQueue
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.model_runtime import ModelRuntimeResolver
 from nanobot.agent.pending_inputs import PendingInputs
 from nanobot.agent.runner import AgentCheckpoint, AgentRunner, AgentRunResult, AgentRunSpec
 from nanobot.agent.session_inbox import SessionExecutionClosedError, SessionInbox, SessionInboxes
+from nanobot.agent.slow_ack import QQSlowAck
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.exec_session import ExecSessionManager
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
-from nanobot.agent.tools.message import capture_message_deliveries
+from nanobot.agent.tools.message import capture_message_deliveries, duplicate_final_should_suppress
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.runtime_control import AgentRuntimeControl
 from nanobot.agent.turn_delivery import (
@@ -425,6 +427,8 @@ class AgentLoop:
         # observes the queue empty and removes it.
         self._pending_queues = SessionInboxes()
         self._preserve_inflight_turns_on_shutdown = False
+        self._image_queue: ImageQueue | None = None
+        self._qq_slow_ack = QQSlowAck()
         self._cron_turns = CronTurnCoordinator(enqueue=self._enqueue_session_message)
         self._local_trigger_turns = LocalTriggerTurnCoordinator(enqueue=self._enqueue_session_message)
         self._automation_turn_coordinators = (
@@ -988,6 +992,8 @@ class AgentLoop:
             await self.sessions.state.acknowledge_followups(key, journaled_followup_ids)
         sub_cancelled = await self.subagents.cancel_by_session(key)
         exec_cancelled = await self._exec_session_manager.terminate_by_owner(key)
+        if self._image_queue is not None:
+            self._image_queue.cancel(key)
         return cancelled + sub_cancelled + exec_cancelled
 
     async def discard_session(self, key: str) -> None:
@@ -1007,6 +1013,8 @@ class AgentLoop:
         if turn_continuation.internal_continuation_inbound(msg.metadata) or any(
             coordinator.owns_turn(msg) for coordinator in self._automation_turn_coordinators
         ):
+            return False
+        if self._image_queue is not None and self._image_queue.tracked(msg):
             return False
         return msg.channel == "system" or not self.commands.is_dispatchable_command(
             command_text(msg)
@@ -1381,6 +1389,7 @@ class AgentLoop:
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
+        self._start_image_queue()
         try:
             logger.info("Agent loop started")
 
@@ -1435,6 +1444,8 @@ class AgentLoop:
             return
         if msg.is_user_input:
             await self.runtime_event_publisher.user_input_accepted(msg, key)
+        if self._image_queue is not None and await self._image_queue.intercept(msg, key):
+            return
         if msg.channel != "system" and self.commands.is_priority(raw):
             await self._dispatch_command_inline(msg, raw, self.commands.dispatch_priority)
             return
@@ -1470,6 +1481,7 @@ class AgentLoop:
             or self.bus.has_pending_events or self._active_tasks or self._background_tasks
             or self._close_lock.locked()
             or self.subagents.has_pending_work or self._exec_session_manager.has_pending_work
+            or (self._image_queue is not None and self._image_queue.backlog())
         )
 
     def preserve_inflight_turns_on_shutdown(self) -> None:
@@ -1595,6 +1607,8 @@ class AgentLoop:
         delivery = self.turn_delivery_factory.unrouted(msg, session_key)
         processing = False
         skip_idle = False
+        image_turn = None
+        image_queue: ImageQueue | None = getattr(self, "_image_queue", None)
         try:
             async with AsyncExitStack() as execution:
                 try:
@@ -1617,12 +1631,27 @@ class AgentLoop:
                         session_key,
                         enable_stream=True,
                     )
-                    response = await self._process_message(
-                        msg,
-                        pending_queue=pending,
-                        delivery=delivery,
+                    slow_ack = getattr(self, "_qq_slow_ack", None)
+                    image_turn = image_queue.bind(msg) if image_queue is not None else None
+                    ack_task = (
+                        slow_ack.start(msg, self.bus.publish_outbound)
+                        if slow_ack is not None
+                        else None
                     )
+                    try:
+                        response = await self._process_message(
+                            msg,
+                            pending_queue=pending,
+                            delivery=delivery,
+                        )
+                    finally:
+                        if ack_task is not None:
+                            ack_task.cancel()
                     await delivery.complete(response, publish_completion=True)
+                    if image_queue is not None:
+                        image_queue.finish(
+                            msg, completed=delivery.stop_reason == "completed",
+                        )
                     if response is not None and delivery.after_command_reply:
                         delivery.after_command_reply()
                     for coordinator in self._automation_turn_coordinators:
@@ -1692,6 +1721,8 @@ class AgentLoop:
                     for coordinator in self._automation_turn_coordinators:
                         coordinator.complete(msg, error=exc)
                 finally:
+                    if image_turn is not None and image_queue is not None:
+                        image_queue.unbind(image_turn, msg)
                     if (processing or delivery.completed) and not skip_idle:
                         await delivery.idle()
         finally:
@@ -1719,9 +1750,35 @@ class AgentLoop:
         async with close_lock:
             await self._aclose_unlocked()
 
+    def _start_image_queue(self) -> None:
+        """Start the opt-in image queue once the tool registry is available."""
+        if self._image_queue is not None:
+            return
+        configured = bool(self.tools_config.image_generation.persistent_queue)
+        if os.environ.get("NANOBOT_IMAGE_QUEUE") != "1" and not configured:
+            return
+        if not self.tools.has("generate_image"):
+            logger.info("Persistent image queue was requested, but generate_image is not enabled")
+            return
+        try:
+            queue = ImageQueue(self)
+        except (OSError, RuntimeError):
+            logger.warning("Persistent image queue could not be started")
+            return
+        self._image_queue = queue
+        self.register_runtime_context_provider(queue.planning_context)
+        queue.start()
+
     async def _aclose_unlocked(self) -> None:
         self._pending_queues.close_admission()
         self._running = False
+        queue = self._image_queue
+        self._image_queue = None
+        if queue is not None:
+            try:
+                await queue.close()
+            except Exception:
+                logger.warning("Persistent image queue did not close cleanly")
         errors: list[BaseException] = []
         active_task_groups = getattr(self, "_active_tasks", {})
         current_task = asyncio.current_task()
@@ -2144,8 +2201,48 @@ class AgentLoop:
             return True
         return command_matched
 
+    async def _apply_qq_default_session_preset(self, session: Session, msg: InboundMessage) -> None:
+        """Give a new QQ chat the configured preset once, without overriding a saved choice."""
+        if msg.channel != "qq" or msg.sender_id in {"subagent", "system"}:
+            return
+        try:
+            if SessionModelPreset.from_metadata(session.metadata).base_preset:
+                return
+        except ValueError:
+            return
+        chat_type = str(msg.metadata.get("chat_type") or "")
+        if chat_type not in {"c2c", "group"}:
+            return
+        env_name = "QQ_PRESET_DM" if chat_type == "c2c" else "QQ_PRESET_GROUP"
+        name = (os.environ.get(env_name) or "").strip() or (self.runtime_resolver.model_preset or "")
+        if not name:
+            return
+        try:
+            runtime = self.runtime_resolver.resolve_preset(name)
+        except Exception as exc:
+            logger.warning(
+                "QQ {} default preset could not be applied ({})",
+                chat_type,
+                type(exc).__name__,
+            )
+            return
+        update = SessionModelPreset(runtime.model_preset).metadata_update()
+        if not update:
+            return
+        session.metadata.update(update)
+        try:
+            await self.sessions.state.update_metadata(
+                session.key,
+                update,
+                create_if_missing=True,
+            )
+        except Exception:
+            logger.debug("QQ preset persist failed")
+
     async def _build_turn(self, ctx: TurnContext) -> None:
         session = ctx.require_session()
+        if ctx.kind is TurnKind.USER:
+            await self._apply_qq_default_session_preset(session, ctx.msg)
         runtime = ctx.runtime
         if runtime is None:
             runtime = await self.runtime_for_session(
@@ -2284,10 +2381,13 @@ class AgentLoop:
         ctx.provider_compaction_applied = result.provider_compaction_applied
         ctx.stop_reason = result.stop_reason
         ctx.failure_error_kind = result.failure_error_kind
-        if (
-            ctx.kind is TurnKind.USER
-            and (ctx.delivery.route.channel, ctx.delivery.route.chat_id) in message_sends
-            and (not result.had_injections or result.stop_reason == "empty_final_response")
+        if ctx.kind is TurnKind.USER and duplicate_final_should_suppress(
+            message_sends,
+            channel=ctx.delivery.route.channel,
+            chat_id=ctx.delivery.route.chat_id,
+            final_content=result.final_content,
+            stop_reason=result.stop_reason,
+            had_injections=result.had_injections,
         ):
             ctx.suppress_response = True
         ctx.usage = result.usage

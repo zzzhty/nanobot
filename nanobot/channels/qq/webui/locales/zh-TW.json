@@ -19,6 +19,18 @@
         "label": "允許使用者",
         "placeholder": "Open ID，以逗號分隔"
       },
+      "groupAllowFrom": {
+        "label": "允許的群組",
+        "placeholder": "群組 Open ID，或 * 表示已經見過的群組"
+      },
+      "requireMention": { "label": "僅在被 @ 時回覆" },
+      "httpTimeout": { "label": "HTTP 逾時（秒）" },
+      "slowAckSeconds": { "label": "慢回執延遲（秒）" },
+      "slowAckTexts": { "label": "慢回執文案" },
+      "senderNames": { "label": "成員顯示名" },
+      "groupContextDir": { "label": "群組上下文目錄" },
+      "groupContextMinutes": { "label": "上下文視窗（分鐘）" },
+      "groupContextLimit": { "label": "上下文條數" },
       "msgFormat": {
         "label": "訊息格式",
         "choices": {

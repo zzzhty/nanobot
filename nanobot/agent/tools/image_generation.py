@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import os
+import re
 from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import httpx
 from loguru import logger
 
-from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
+from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.image_generation_config import ImageGenerationToolConfig
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.schema import (
@@ -32,35 +35,98 @@ from nanobot.utils.artifacts import (
 )
 from nanobot.utils.helpers import detect_image_mime
 
+_SECRET_RE = re.compile(r"(?i)\b(?:api[_-]?key|token|secret|bearer)\b\s*[:=]\s*\S+")
+_URL_RE = re.compile(r"https?://\S+")
+
+
+class ImageRequestRejectedError(Exception):
+    """The provider finished and refused this request or returned no usable image."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class ImageRequestUnresolvedError(Exception):
+    """The call ended without proof that the provider accepted or rejected it."""
+
+
+def public_image_reason(exc: BaseException) -> str:
+    text = " ".join(_URL_RE.sub("", _SECRET_RE.sub("", str(exc))).split())
+    if not text:
+        return "生图服务返回了失败结果"
+    return text[:160]
+
+
+def _transport_gave_up(exc: BaseException) -> bool:
+    """True when the call ended without a provider response.
+
+    A status code means the service answered. A timeout or dropped connection
+    does not prove that the service never started the job.
+    """
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, httpx.HTTPStatusError):
+            return False
+        if isinstance(current, (httpx.TimeoutException, httpx.RequestError, TimeoutError, ConnectionError)):
+            return True
+        current = current.__cause__
+    return False
+
+
 if TYPE_CHECKING:
     from nanobot.agent.tools.context import ToolContext
     from nanobot.config.schema import Config, ProviderConfig
 
 
-@tool_parameters(
-    tool_parameters_schema(
-        prompt=StringSchema(
-            "Detailed image generation or edit instructions.",
-            min_length=1,
-        ),
-        reference_images=ArraySchema(
-            StringSchema(""),
-            description="Existing local image paths for edits, including prior generated artifacts.",
-        ),
-        aspect_ratio=StringSchema(
-            "Output aspect ratio, e.g. 1:1 or 16:9.",
-        ),
-        image_size=StringSchema(
-            "Provider-supported output size hint, e.g. 1K or 1024x1024.",
-        ),
-        count=IntegerSchema(
-            description="Number of images to generate in this turn.",
-            minimum=1,
-            maximum=8,
-        ),
-        required=["prompt"],
-    )
+_IMAGE_PARAMETERS = tool_parameters_schema(
+    prompt=StringSchema(
+        "Detailed image generation or edit instructions.",
+        min_length=1,
+    ),
+    reference_images=ArraySchema(
+        StringSchema(""),
+        description="Existing local image paths for edits, including prior generated artifacts.",
+    ),
+    aspect_ratio=StringSchema(
+        "Output aspect ratio, e.g. 1:1 or 16:9.",
+    ),
+    image_size=StringSchema(
+        "Provider-supported output size hint, e.g. 1K or 1024x1024.",
+    ),
+    count=IntegerSchema(
+        description="Number of images to generate in this turn.",
+        minimum=1,
+        maximum=8,
+    ),
+    required=["prompt"],
 )
+
+
+def _queue_parameters() -> dict[str, Any]:
+    schema = deepcopy(_IMAGE_PARAMETERS)
+    properties = schema["properties"]
+    properties["queue_mode"] = StringSchema(
+        "For the gateway queue: status to inspect drafts; merge (default) with a full updated brief; "
+        "new for a separate image; recover to read interrupted inputs; defer to hold a draft for clarification; "
+        "wait to keep observing the same running provider call; "
+        "retry to start one new attempt after the user asks to try again. "
+        "wait does not generate again. retry does not recover the original connection, "
+        "and an unknown or still-running original may already have been billed. "
+        "The extra observation time is an internal limit, not a duration the user has to name. "
+        "status.can_wait is false when that call has finished, was cancelled, or the process restarted. "
+        "An unconfirmed provider call is not retried and does not block a later draft.",
+        enum=["status", "merge", "new", "recover", "defer", "wait", "retry"],
+    ).to_json_schema()
+    properties["draft_id"] = StringSchema(
+        "ID from status. A draft is edited; a frozen image may seed the next draft.",
+    ).to_json_schema()
+    schema["required"] = []
+    return schema
+
+
 class ImageGenerationTool(Tool):
     """Generate persistent image artifacts through the configured image provider."""
 
@@ -105,9 +171,29 @@ class ImageGenerationTool(Tool):
 
     @property
     def description(self) -> str:
+        if self._queue_enabled():
+            return (
+                "Queue image generation for the current interactive QQ or WebUI turn. "
+                "The gateway delivers those results later. On every other turn, generate the image immediately. "
+                "Use status before modifying a pending image. Do not claim completion or submit twice. "
+                "Use new only for a separate request. "
+                "If the user asks to keep waiting for an image that is already running, use queue_mode=wait. "
+                "If the user asks to try that image again, use queue_mode=retry and say when the original may already have been billed."
+            )
         return (
             "Generate or edit images as persistent artifacts. Returns artifact IDs and local paths."
         )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        if self._queue_enabled():
+            return _queue_parameters()
+        return deepcopy(_IMAGE_PARAMETERS)
+
+    def _queue_enabled(self) -> bool:
+        if os.environ.get("NANOBOT_IMAGE_QUEUE") == "1":
+            return True
+        return bool(self.config.persistent_queue)
 
     def _provider_config(self) -> ProviderConfig | None:
         return self.provider_configs.get(self.config.provider)
@@ -156,19 +242,57 @@ class ImageGenerationTool(Tool):
             raise ImageGenerationError(f"unsupported reference image: {value}")
         return str(resolved)
 
-    def _resolve_reference_images(self, values: list[str] | None) -> list[str]:
+    def resolve_reference_images(self, values: list[str] | None) -> list[str]:
         if not values:
             return []
         return [self._resolve_reference_image(value) for value in values if value]
 
     async def execute(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
-        prompt: str,
+        prompt: str | None = None,
         reference_images: list[str] | None = None,
         aspect_ratio: str | None = None,
         image_size: str | None = None,
         count: int | None = None,
+        queue_mode: str = "merge",
+        draft_id: str | None = None,
         **kwargs: Any,
+    ) -> str:
+        if self._queue_enabled():
+            from nanobot.agent.image_queue import handle_image_request, interactive_queue_turn
+
+            if interactive_queue_turn():
+                return await handle_image_request(
+                    self,
+                    prompt,
+                    reference_images,
+                    aspect_ratio,
+                    image_size,
+                    count,
+                    queue_mode,
+                    draft_id,
+                )
+            if queue_mode not in {"merge", "new"}:
+                return ToolResult.error(
+                    "Queued image controls require an interactive QQ or WebUI user turn. "
+                    "Other turns generate the image directly."
+                )
+        if not prompt or queue_mode not in {"merge", "new"}:
+            return ToolResult.error(
+                "Error: a prompt is required; queue controls are only available when the persistent image queue is enabled"
+            )
+        return await self.generate_now(prompt, reference_images, aspect_ratio, image_size, count)
+
+    async def generate_now(
+        self,
+        prompt: str,
+        reference_images: list[str] | None,
+        aspect_ratio: str | None,
+        image_size: str | None,
+        count: int | None,
+        *,
+        references_are_resolved: bool = False,
+        propagate_provider_errors: bool = False,
     ) -> str:
         client = self._provider_client()
         if client is None:
@@ -182,7 +306,11 @@ class ImageGenerationTool(Tool):
             )
 
         try:
-            refs = self._resolve_reference_images(reference_images)
+            refs = (
+                list(reference_images or [])
+                if references_are_resolved
+                else self.resolve_reference_images(reference_images)
+            )
             artifacts: list[dict[str, Any]] = []
             while len(artifacts) < requested:
                 response = await client.generate(
@@ -205,7 +333,23 @@ class ImageGenerationTool(Tool):
                     if len(artifacts) >= requested:
                         break
             return generated_image_tool_result(artifacts)
-        except (ArtifactError, ImageGenerationError, OSError) as exc:
+        except ImageGenerationError as exc:
+            if propagate_provider_errors:
+                if _transport_gave_up(exc):
+                    raise ImageRequestUnresolvedError() from exc
+                raise ImageRequestRejectedError(public_image_reason(exc)) from exc
+            return ToolResult.error(f"Error: {exc}")
+        except ArtifactError as exc:
+            if propagate_provider_errors:
+                raise ImageRequestRejectedError("图片没有保存下来") from exc
+            return ToolResult.error(f"Error: {exc}")
+        except httpx.HTTPStatusError as exc:
+            if propagate_provider_errors:
+                raise ImageRequestRejectedError(public_image_reason(exc)) from exc
+            return ToolResult.error(f"Error: {exc}")
+        except (OSError, httpx.HTTPError) as exc:
+            if propagate_provider_errors:
+                raise ImageRequestUnresolvedError() from exc
             return ToolResult.error(f"Error: {exc}")
 
 

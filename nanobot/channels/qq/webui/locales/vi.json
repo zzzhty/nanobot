@@ -19,6 +19,18 @@
         "label": "Người dùng được phép",
         "placeholder": "Open ID, phân tách bằng dấu phẩy"
       },
+      "groupAllowFrom": {
+        "label": "Nhóm được phép",
+        "placeholder": "Open ID nhóm, hoặc * cho nhóm đã thấy"
+      },
+      "requireMention": { "label": "Chỉ trả lời khi được nhắc" },
+      "httpTimeout": { "label": "Thời gian chờ HTTP (giây)" },
+      "slowAckSeconds": { "label": "Độ trễ biên nhận chậm (giây)" },
+      "slowAckTexts": { "label": "Nội dung biên nhận chậm" },
+      "senderNames": { "label": "Tên hiển thị thành viên" },
+      "groupContextDir": { "label": "Thư mục ngữ cảnh nhóm" },
+      "groupContextMinutes": { "label": "Cửa sổ ngữ cảnh (phút)" },
+      "groupContextLimit": { "label": "Giới hạn tin ngữ cảnh" },
       "msgFormat": {
         "label": "Định dạng tin nhắn",
         "choices": {

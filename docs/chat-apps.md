@@ -624,6 +624,7 @@ nanobot channels login qq
 To enter them yourself, copy **AppID** and **AppSecret** from **开发设置 (Developer Settings)** into `channels.qq`:
 
 > - `allowFrom`: Add your openid (find it in nanobot logs when you message the bot). Use `["*"]` for public access.
+> - `groupAllowFrom`: Optional on this fork. Group open IDs that authorize the whole group. `"*"` allows groups the process has already seen and does not allow direct messages. The bot still replies in a group only when it is mentioned, unless `requireMention` is false. Recent non-mention text from an authorized group can be attached as context; it is not a full archive.
 > - `msgFormat`: Optional. Use `"plain"` (default) for maximum compatibility with legacy QQ clients, or `"markdown"` for richer formatting on newer clients.
 > - For production: submit a review in the bot console and publish. See [QQ Bot Docs](https://bot.q.qq.com/wiki/) for the full publishing flow.
 
@@ -635,6 +636,7 @@ To enter them yourself, copy **AppID** and **AppSecret** from **开发设置 (De
       "appId": "YOUR_APP_ID",
       "secret": "YOUR_APP_SECRET",
       "allowFrom": ["YOUR_OPENID"],
+      "groupAllowFrom": ["GROUP_OPENID"],
       "msgFormat": "plain"
     }
   }
