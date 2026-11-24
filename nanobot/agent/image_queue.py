@@ -1,8 +1,9 @@
 """Persistent image queue for interactive QQ and WebUI sessions.
 
 Interactive turns admit work in order. A draft is frozen in one SQLite
-transaction before the provider is called. Closing the gateway keeps unsent
-drafts and marks an in-flight call unknown instead of retrying it.
+transaction before the provider is called. A provider call that times out,
+fails, or is still running when the gateway stops becomes unknown and is not
+submitted again. That unknown row does not block a later draft.
 """
 
 from __future__ import annotations
@@ -48,6 +49,9 @@ if TYPE_CHECKING:
 
 TOKEN_KEY = "_local_image_queue_input"
 DEBOUNCE = 8.0
+PROVIDER_TIMEOUT = 180.0
+DELIVERY_TIMEOUT = 30.0
+_BACKGROUND_GRACE = 1.0
 
 
 def _as_object(value: object) -> dict[str, Any] | None:
@@ -111,10 +115,14 @@ class ImageQueue:
         *,
         clock: Callable[[], float] = time.time,
         debounce: float = DEBOUNCE,
+        provider_timeout: float = PROVIDER_TIMEOUT,
+        delivery_timeout: float = DELIVERY_TIMEOUT,
     ) -> None:
         self.loop = loop
         self.clock = clock
         self.debounce = debounce
+        self.provider_timeout = provider_timeout
+        self.delivery_timeout = delivery_timeout
         self.root = Path(root) if root is not None else get_data_dir() / "image-queue"
         self._prepare_dir(self.root)
         self.refs = self.root / "refs"
@@ -125,6 +133,7 @@ class ImageQueue:
         self.by_session: dict[str, dict[str, None]] = {}
         self.deferred: set[str] = set()
         self.pump: asyncio.Task[None] | None = None
+        self._background: dict[str, set[asyncio.Task[Any]]] = {}
         self._owner = FileLock(str(self.root / "owner.lock"))
         try:
             self._owner.acquire(timeout=0)
@@ -145,9 +154,15 @@ class ImageQueue:
                         due REAL NOT NULL, changed REAL NOT NULL, cancelled INTEGER NOT NULL DEFAULT 0,
                         paths TEXT NOT NULL DEFAULT '[]', notice INTEGER NOT NULL DEFAULT 0)"""
                 )
+                columns = {str(row[1]) for row in db.execute("PRAGMA table_info(jobs)")}
+                if "delivery_error" not in columns:
+                    db.execute(
+                        "ALTER TABLE jobs ADD COLUMN delivery_error INTEGER NOT NULL DEFAULT 0"
+                    )
+                db.execute("DROP INDEX IF EXISTS one_paid_call_per_session")
                 db.execute(
-                    """CREATE UNIQUE INDEX IF NOT EXISTS one_paid_call_per_session
-                       ON jobs(session) WHERE state IN ('running','unknown')"""
+                    """CREATE UNIQUE INDEX one_paid_call_per_session
+                       ON jobs(session) WHERE state='running'"""
                 )
                 db.execute("CREATE INDEX IF NOT EXISTS image_queue_fifo ON jobs(session, state, due)")
                 db.execute(
@@ -190,13 +205,18 @@ class ImageQueue:
         self.pump = None
         if pump is not None:
             pump.cancel()
-            await asyncio.gather(pump, return_exceptions=True)
         tasks = tuple(self.workers.values())
         for task in tasks:
             task.cancel()
+        background = tuple(task for group in self._background.values() for task in group)
+        for task in background:
+            task.cancel()
         try:
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            pending = tuple(task for task in (pump, *tasks) if task is not None)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if background:
+                await asyncio.wait(background, timeout=_BACKGROUND_GRACE)
             with self._tx() as db:
                 db.execute(
                     """UPDATE jobs SET state='unknown', changed=?, notice=cancelled
@@ -241,16 +261,27 @@ class ImageQueue:
                        WHERE session=? AND generation=? AND state IN ('draft','running','unknown')""",
                     (record.key, ctx.session_generation),
                 ).fetchall()
+                undelivered = db.execute(
+                    """SELECT 1 FROM jobs
+                       WHERE session=? AND generation=? AND delivery_error=1 LIMIT 1""",
+                    (record.key, ctx.session_generation),
+                ).fetchone() is not None
         except sqlite3.Error:
             return None
         states = sorted({str(row[0]) for row in rows})
-        if not states:
+        if not states and not undelivered:
             return None
-        lines = [
-            f"Image queue in this conversation: {', '.join(states)}.",
-            "If the current input adds or changes image requirements, use generate_image status and update the full draft. If clarification is needed, hold the draft with defer before asking.",
-            "Do not queue a new image for unrelated chat. A running image cannot be changed; an unknown provider call must not be retried.",
-        ]
+        lines: list[str] = []
+        if states:
+            lines.extend((
+                f"Image queue in this conversation: {', '.join(states)}.",
+                "If the current input adds or changes image requirements, use generate_image status and update the full draft. If clarification is needed, hold the draft with defer before asking.",
+                "Do not queue a new image for unrelated chat. A running image cannot be changed. status.unconfirmed_call means that call must not be retried; it does not block a later draft.",
+            ))
+        if undelivered:
+            lines.append(
+                "An earlier image result was not delivered. Read status for its paths and do not generate that image again."
+            )
         return RuntimeContextBlock("local-image-queue", wrap_runtime_context_lines(lines))
 
     def admit(self, msg: InboundMessage) -> None:
@@ -367,9 +398,15 @@ class ImageQueue:
             ).rowcount
             db.execute("DELETE FROM inbox WHERE session=?", (key,))
             db.execute(
-                "UPDATE jobs SET cancelled=1, notice=1 WHERE session=? AND state='unknown'",
-                (key,),
+                """UPDATE jobs SET state='cancelled', params=NULL, cancelled=1, notice=1, changed=?
+                   WHERE session=? AND state='unknown'""",
+                (self._now(), key),
             )
+        worker = self.workers.get(key)
+        if worker is not None:
+            worker.cancel()
+        for task in tuple(self._background.get(key, ())):
+            task.cancel()
         for token in self.by_session.pop(key, {}):
             self.inputs.pop(token, None)
             self.deferred.discard(token)
@@ -400,7 +437,7 @@ class ImageQueue:
             ):
                 self.recovery(record, header.generation, "resume")
                 self.finish(msg, True)
-                text = "已解除生图暂停。未确认的旧请求不会重试，未处理的追加已清除。"
+                text = "已确认未完成的生图记录。旧请求不会重试，未处理的追加已清除。新的请求可以继续。"
             else:
                 text = "这个会话没有可恢复的生图队列。"
             delivery = self.loop.turn_delivery_factory.create(msg, key)
@@ -418,7 +455,7 @@ class ImageQueue:
     def status(self, key: str, generation: str) -> dict[str, Any]:
         with self._tx() as db:
             jobs = db.execute(
-                """SELECT id, version, state, mergeable, cancelled, params, paths FROM jobs
+                """SELECT id, version, state, mergeable, cancelled, delivery_error, notice, params, paths FROM jobs
                    WHERE session=? AND generation=?
                    ORDER BY CASE WHEN state IN ('draft','running','unknown') THEN 0 ELSE 1 END,
                    rowid DESC LIMIT 18""",
@@ -441,6 +478,8 @@ class ImageQueue:
                 "state": str(job["state"]),
                 "mergeable": int(job["mergeable"]),
                 "cancelled": int(job["cancelled"]),
+                "delivery_error": int(job["delivery_error"]),
+                "notice": int(job["notice"]),
                 "paths": _json_strings(str(job["paths"] or "[]")),
             }
             row.update({name: value for name, value in params.items() if name != "reference_images"})
@@ -448,7 +487,7 @@ class ImageQueue:
         unresolved = sum(str(item["id"]) not in self.inputs for item in held)
         return {
             "jobs": visible,
-            "paused_after_unknown_call": paused,
+            "unconfirmed_call": paused,
             "unresolved_inputs": unresolved,
         }
 
@@ -471,7 +510,7 @@ class ImageQueue:
                 (self._now(), record.key),
             )
         self.wake.set()
-        return "Queue unpaused. No interrupted provider call has been retried."
+        return "Unconfirmed image call acknowledged. It was not retried."
 
     def defer(self, record: Input, generation: str) -> str:
         with self._tx() as db:
@@ -662,8 +701,8 @@ class ImageQueue:
         prompt = params.get("prompt")
         aspect_ratio = params.get("aspect_ratio")
         image_size = params.get("image_size")
-        try:
-            result = await tool.generate_now(
+        call = asyncio.create_task(
+            tool.generate_now(
                 prompt if isinstance(prompt, str) else "",
                 refs,
                 aspect_ratio if isinstance(aspect_ratio, str) else None,
@@ -671,6 +710,29 @@ class ImageQueue:
                 count,
                 references_are_resolved=True,
             )
+        )
+        self._track(str(selected["session"]), call)
+        try:
+            done, _pending = await asyncio.wait({call}, timeout=self.provider_timeout)
+        except asyncio.CancelledError:
+            call.cancel()
+            self._settle(selected, "unknown")
+            raise
+        if call not in done:
+            call.cancel()
+            logger.warning("Image provider call timed out")
+            self._settle(selected, "unknown")
+            return
+        try:
+            result = call.result()
+        except asyncio.CancelledError:
+            self._settle(selected, "unknown")
+            raise
+        except Exception as exc:
+            logger.warning("Image provider call has no confirmed result: {}", type(exc).__name__)
+            self._settle(selected, "unknown")
+            return
+        try:
             parsed = _json_object(result)
             paths: list[str] = []
             artifacts = parsed.get("artifacts")
@@ -684,9 +746,6 @@ class ImageQueue:
                     paths.append(artifact_path)
             if not paths:
                 raise ValueError("no artifact paths")
-        except asyncio.CancelledError:
-            self._settle(selected, "unknown")
-            raise
         except Exception as exc:
             logger.warning("Image provider call has no confirmed result: {}", type(exc).__name__)
             self._settle(selected, "unknown")
@@ -694,19 +753,14 @@ class ImageQueue:
             self._settle(selected, "done", paths)
 
     async def notice(self, job: sqlite3.Row) -> None:
-        allowed = await self._header_ok(job)
-        with self._tx() as db:
-            accepted = db.execute(
-                "UPDATE jobs SET notice=1 WHERE id=? AND state=? AND notice=0",
-                (str(job["id"]), str(job["state"])),
-            ).rowcount
-        if not (accepted and allowed):
+        if not await self._header_ok(job):
+            self._mark_notice(job, error=False)
             return
         paths = _json_strings(str(job["paths"] or "[]"))
         text = {
             "done": "图画好了。",
             "failed": "草稿没发出：生图设置或参考图已变更。",
-            "unknown": "上一份生图未能确认结果，没有重试。队列已暂停；可以先让我查看未处理的追加，再发 /image-resume 解除暂停。",
+            "unknown": "上一份生图没有确认结果，已经停止，不会自动重发。新的生图请求可以继续。要清掉这条未确认记录，可以发 /image-resume。",
         }[str(job["state"])]
         metadata: dict[str, Any] = {
             "_record_channel_delivery": True,
@@ -718,28 +772,50 @@ class ImageQueue:
             metadata["message_id"] = message_id
         if str(job["channel"]) == "websocket":
             metadata[HISTORY_GENERATION_METADATA_KEY] = str(job["generation"])
-        media = paths
-        await deliver_to_channel(
-            OutboundMessage(
-                str(job["channel"]),
-                str(job["chat"]),
-                text,
-                media=media,
-                metadata=metadata,
-                delivery=DeliveryRequest(
-                    "image-" + str(job["id"]),
-                    str(job["session"]),
-                    str(job["generation"]),
+        call = asyncio.create_task(
+            deliver_to_channel(
+                OutboundMessage(
+                    str(job["channel"]),
+                    str(job["chat"]),
+                    text,
+                    media=paths,
+                    metadata=metadata,
+                    delivery=DeliveryRequest(
+                        "image-" + str(job["id"]),
+                        str(job["session"]),
+                        str(job["generation"]),
+                    ),
                 ),
-            ),
-            bus=self.loop.bus,
-            session_manager=self.loop.sessions,
+                bus=self.loop.bus,
+                session_manager=self.loop.sessions,
+            )
         )
+        self._track(str(job["session"]), call)
+        try:
+            done, _pending = await asyncio.wait({call}, timeout=self.delivery_timeout)
+        except asyncio.CancelledError:
+            call.cancel()
+            raise
+        if call not in done:
+            call.cancel()
+            logger.warning("Image result delivery timed out")
+            self._mark_notice(job, error=True)
+            return
+        try:
+            call.result()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Image result was not delivered: {}", type(exc).__name__)
+            self._mark_notice(job, error=True)
+            return
+        self._mark_notice(job, error=False)
 
     async def run(self) -> None:
         while True:
             self.wake.clear()
             try:
+                self._release_abandoned_running()
                 for job in self._candidates():
                     key = str(job["session"])
                     if key in self.workers:
@@ -756,10 +832,12 @@ class ImageQueue:
                 pass
 
     def _finished(self, key: str, task: asyncio.Task[None]) -> None:
-        self.workers.pop(key, None)
-        if not task.cancelled() and task.exception() is not None:
-            logger.warning("Image queue worker failed: {}", type(task.exception()).__name__)
-            return
+        if self.workers.get(key) is task:
+            self.workers.pop(key, None)
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                logger.warning("Image queue worker failed: {}", type(exc).__name__)
         self.wake.set()
 
     def _candidates(self) -> list[sqlite3.Row]:
@@ -768,7 +846,7 @@ class ImageQueue:
                 """SELECT j.* FROM jobs j WHERE
                    (j.state='draft' AND j.due<=? AND NOT EXISTS (
                        SELECT 1 FROM jobs b WHERE b.session=j.session AND
-                       (b.state IN ('running','unknown') OR (b.state='draft' AND b.rowid<j.rowid))
+                       (b.state='running' OR (b.state='draft' AND b.rowid<j.rowid))
                    ) AND NOT EXISTS (
                        SELECT 1 FROM inbox i WHERE i.session=j.session AND i.generation=j.generation
                    ))
@@ -789,8 +867,7 @@ class ImageQueue:
                    )
                    AND NOT EXISTS (
                        SELECT 1 FROM jobs other WHERE other.session=j.session AND
-                       (other.state IN ('running','unknown')
-                        OR (other.state='draft' AND other.rowid<j.rowid))
+                       (other.state='running' OR (other.state='draft' AND other.rowid<j.rowid))
                    )
                    RETURNING *""",
                 (now, str(job["id"]), int(job["version"]), now),
@@ -810,12 +887,11 @@ class ImageQueue:
         with self._tx() as db:
             db.execute(
                 """UPDATE jobs SET
-                   state=CASE WHEN cancelled=1 AND ?!='unknown' THEN 'cancelled' ELSE ? END,
+                   state=CASE WHEN cancelled=1 THEN 'cancelled' ELSE ? END,
                    paths=CASE WHEN cancelled=1 THEN '[]' ELSE ? END,
                    changed=?, notice=cancelled
                    WHERE id=? AND state=? AND version=?""",
                 (
-                    state,
                     state,
                     json.dumps(saved_paths),
                     self._now(),
@@ -856,6 +932,54 @@ class ImageQueue:
             "DELETE FROM inbox WHERE session=? AND generation=? AND reason='defer'",
             (key, generation),
         )
+
+    def _mark_notice(self, job: sqlite3.Row, *, error: bool) -> None:
+        with self._tx() as db:
+            db.execute(
+                """UPDATE jobs SET notice=1, delivery_error=?
+                   WHERE id=? AND state=? AND notice=0""",
+                (int(error), str(job["id"]), str(job["state"])),
+            )
+
+    def _release_abandoned_running(self) -> None:
+        """A running row with no live worker is unconfirmed. Do not send it again."""
+        live = set(self.workers)
+        now = self._now()
+        with self._tx() as db:
+            rows = db.execute(
+                "SELECT id, session, cancelled FROM jobs WHERE state='running'"
+            ).fetchall()
+            for row in rows:
+                if str(row["session"]) in live:
+                    continue
+                if int(row["cancelled"]):
+                    db.execute(
+                        """UPDATE jobs SET state='cancelled', notice=1, changed=?
+                           WHERE id=? AND state='running'""",
+                        (now, str(row["id"])),
+                    )
+                else:
+                    db.execute(
+                        """UPDATE jobs SET state='unknown', notice=0, changed=?
+                           WHERE id=? AND state='running'""",
+                        (now, str(row["id"])),
+                    )
+
+    def _track(self, key: str, task: asyncio.Task[Any]) -> None:
+        bucket = self._background.setdefault(key, set())
+        bucket.add(task)
+
+        def _drop(done: asyncio.Task[Any], session_key: str = key) -> None:
+            if not done.cancelled():
+                done.exception()
+            tasks = self._background.get(session_key)
+            if tasks is None:
+                return
+            tasks.discard(done)
+            if not tasks:
+                self._background.pop(session_key, None)
+
+        task.add_done_callback(_drop)
 
     def _drop_input(self, record: Input) -> None:
         self.inputs.pop(record.id, None)

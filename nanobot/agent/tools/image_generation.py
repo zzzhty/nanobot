@@ -68,7 +68,8 @@ def _queue_parameters() -> dict[str, Any]:
     properties["queue_mode"] = StringSchema(
         "For the gateway queue: status to inspect drafts; merge (default) with a full updated brief; "
         "new for a separate image; recover to read interrupted inputs; defer to hold a draft for clarification. "
-        "Only the user can unpause it, by sending /image-resume.",
+        "An unconfirmed provider call is not retried and does not block a later draft. "
+        "Only the user can acknowledge it, by sending /image-resume.",
         enum=["status", "merge", "new", "recover", "defer"],
     ).to_json_schema()
     properties["draft_id"] = StringSchema(
