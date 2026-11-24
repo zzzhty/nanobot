@@ -19,7 +19,7 @@ If the `generate_image` tool is not available in the current tool list, tell the
 
 ## Gateway Queue
 
-Follow this section only when the `generate_image` description says the gateway queues the image. Call `queue_mode=status` before changing a draft. `merge` replaces the full brief, `new` starts a separate image, and `defer` holds the draft until the user answers, sends `/stop`, or the draft is revised. `recover` reads an interrupted input. An unconfirmed provider call must not be submitted again, and it does not block a later draft. `/image-resume` acknowledges that call and drops leftover holds. Do not submit the same input twice. The gateway sends the finished image later; do not claim that it is finished in the current turn. `/stop` and `/new` remain commands.
+Follow this section only when the `generate_image` description says the gateway queues the image. Call `queue_mode=status` before changing a draft. `merge` replaces the full brief, `new` starts a separate image, and `defer` holds the draft until the user answers, sends `/stop`, or the draft is revised. `recover` reads an interrupted input. Do not submit an unconfirmed or still-running provider call again. The user sends exactly `/image-wait` to keep observing that same request, or exactly `/image-retry` to start a separate attempt that may be billed again. `/image-resume` acknowledges an unconfirmed call and drops leftover holds. Do not send those commands yourself. Do not submit the same input twice. The gateway sends the finished image later; do not claim that it is finished in the current turn. `/stop` and `/new` remain commands.
 
 ## Prompt Rules
 

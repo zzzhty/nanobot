@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import re
 from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import httpx
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool, ToolResult
@@ -32,6 +34,47 @@ from nanobot.utils.artifacts import (
     store_generated_image_artifact,
 )
 from nanobot.utils.helpers import detect_image_mime
+
+_SECRET_RE = re.compile(r"(?i)\b(?:api[_-]?key|token|secret|bearer)\b\s*[:=]\s*\S+")
+_URL_RE = re.compile(r"https?://\S+")
+
+
+class ImageRequestRejectedError(Exception):
+    """The provider finished and refused this request or returned no usable image."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class ImageRequestUnresolvedError(Exception):
+    """The call ended without proof that the provider accepted or rejected it."""
+
+
+def public_image_reason(exc: BaseException) -> str:
+    text = " ".join(_URL_RE.sub("", _SECRET_RE.sub("", str(exc))).split())
+    if not text:
+        return "生图服务返回了失败结果"
+    return text[:160]
+
+
+def _transport_gave_up(exc: BaseException) -> bool:
+    """True when the call ended without a provider response.
+
+    A status code means the service answered. A timeout or dropped connection
+    does not prove that the service never started the job.
+    """
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, httpx.HTTPStatusError):
+            return False
+        if isinstance(current, (httpx.TimeoutException, httpx.RequestError, TimeoutError, ConnectionError)):
+            return True
+        current = current.__cause__
+    return False
+
 
 if TYPE_CHECKING:
     from nanobot.agent.tools.context import ToolContext
@@ -69,7 +112,8 @@ def _queue_parameters() -> dict[str, Any]:
         "For the gateway queue: status to inspect drafts; merge (default) with a full updated brief; "
         "new for a separate image; recover to read interrupted inputs; defer to hold a draft for clarification. "
         "An unconfirmed provider call is not retried and does not block a later draft. "
-        "Only the user can acknowledge it, by sending /image-resume.",
+        "Only the user can send /image-wait to keep observing that same request, "
+        "or /image-retry to start a separate attempt.",
         enum=["status", "merge", "new", "recover", "defer"],
     ).to_json_schema()
     properties["draft_id"] = StringSchema(
@@ -242,6 +286,7 @@ class ImageGenerationTool(Tool):
         count: int | None,
         *,
         references_are_resolved: bool = False,
+        propagate_provider_errors: bool = False,
     ) -> str:
         client = self._provider_client()
         if client is None:
@@ -282,7 +327,23 @@ class ImageGenerationTool(Tool):
                     if len(artifacts) >= requested:
                         break
             return generated_image_tool_result(artifacts)
-        except (ArtifactError, ImageGenerationError, OSError) as exc:
+        except ImageGenerationError as exc:
+            if propagate_provider_errors:
+                if _transport_gave_up(exc):
+                    raise ImageRequestUnresolvedError() from exc
+                raise ImageRequestRejectedError(public_image_reason(exc)) from exc
+            return ToolResult.error(f"Error: {exc}")
+        except ArtifactError as exc:
+            if propagate_provider_errors:
+                raise ImageRequestRejectedError("图片没有保存下来") from exc
+            return ToolResult.error(f"Error: {exc}")
+        except httpx.HTTPStatusError as exc:
+            if propagate_provider_errors:
+                raise ImageRequestRejectedError(public_image_reason(exc)) from exc
+            return ToolResult.error(f"Error: {exc}")
+        except (OSError, httpx.HTTPError) as exc:
+            if propagate_provider_errors:
+                raise ImageRequestUnresolvedError() from exc
             return ToolResult.error(f"Error: {exc}")
 
 

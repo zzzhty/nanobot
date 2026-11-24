@@ -6,6 +6,7 @@ import binascii
 import re
 from abc import ABC, abstractmethod
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -24,6 +25,8 @@ from nanobot.security.network import (
 )
 from nanobot.utils.helpers import detect_image_mime
 
+# Queued generations keep one HTTP call open across the soft wait and one extension.
+image_http_timeout: ContextVar[float | None] = ContextVar("image_http_timeout", default=None)
 _OPENROUTER_ATTRIBUTION_HEADERS = {
     "HTTP-Referer": "https://github.com/HKUDS/nanobot",
     "X-OpenRouter-Title": "nanobot",
@@ -306,7 +309,11 @@ class ImageGenerationProvider(ABC):
         raise ImageGenerationError(f"{label} returned no images for this request")
 
     def _http_client_kwargs(self) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {"timeout": self.timeout}
+        timeout = self.timeout
+        override = image_http_timeout.get()
+        if override is not None:
+            timeout = max(timeout, override)
+        kwargs: dict[str, Any] = {"timeout": timeout}
         if self.proxy:
             kwargs["proxy"] = self.proxy
             kwargs["trust_env"] = False

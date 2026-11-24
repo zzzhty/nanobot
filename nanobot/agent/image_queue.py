@@ -1,9 +1,11 @@
 """Persistent image queue for interactive QQ and WebUI sessions.
 
 Interactive turns admit work in order. A draft is frozen in one SQLite
-transaction before the provider is called. A provider call that times out,
-fails, or is still running when the gateway stops becomes unknown and is not
-submitted again. That unknown row does not block a later draft.
+transaction before the provider is called. The first 180 seconds are a soft wait: the same provider call keeps running and
+the user is asked whether to observe it for five more minutes or start a new
+attempt. A provider that has already answered with a failure is not described
+as a timeout. Restart cannot recover a call, because providers have no task
+query.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import shutil
 import sqlite3
 import time
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +29,11 @@ from loguru import logger
 
 from nanobot.agent.tools.base import ToolResult
 from nanobot.agent.tools.context import current_request_context
-from nanobot.agent.tools.image_generation import ImageGenerationTool
+from nanobot.agent.tools.image_generation import (
+    ImageGenerationTool,
+    ImageRequestRejectedError,
+    public_image_reason,
+)
 from nanobot.bus.channel_delivery import deliver_to_channel
 from nanobot.bus.delivery import DeliveryRequest
 from nanobot.bus.events import (
@@ -37,6 +43,7 @@ from nanobot.bus.events import (
 )
 from nanobot.command.router import command_text
 from nanobot.config.paths import get_data_dir
+from nanobot.providers.image_generation import image_http_timeout
 from nanobot.runtime_context import RuntimeContextBlock, wrap_runtime_context_lines
 from nanobot.session.automation_turns import automation_history_overrides
 from nanobot.session.display_history import HISTORY_GENERATION_METADATA_KEY
@@ -51,7 +58,9 @@ TOKEN_KEY = "_local_image_queue_input"
 DEBOUNCE = 8.0
 PROVIDER_TIMEOUT = 180.0
 DELIVERY_TIMEOUT = 30.0
+WATCH_EXTEND = 300.0
 _BACKGROUND_GRACE = 1.0
+_IMAGE_CHOICES = {"/image-wait", "/image-retry"}
 
 
 def _as_object(value: object) -> dict[str, Any] | None:
@@ -105,6 +114,75 @@ class Input:
     media: tuple[str, ...]
 
 
+def _span(seconds: float) -> str:
+    minutes = max(1, round(seconds / 60))
+    return f"{minutes} 分钟"
+
+
+def _soft_prompt(waited: float, extend: float) -> str:
+    waited_text = _span(waited)
+    extend_text = _span(extend)
+    return (
+        f"已经等了 {waited_text}，这条请求可能还在生成。我没有把它当成失败，也没有重新发送。"
+        f"发送 /image-wait 再观察同一条请求 {extend_text}。发送 /image-retry 会重新生成，原来的请求可能已经计费。"
+        f"如果 {extend_text}内不选择，我将停止观察，之后不能再等回结果。"
+    )
+
+
+def _terminal_text(state: str, detail: str) -> str:
+    if state == "done":
+        return "图画好了。"
+    if state == "failed":
+        reason = detail or "生图设置或参考图已变更"
+        return (
+            f"生图失败：{reason}。这是已经返回的结果，不是超时。"
+            "没有自动重试。若要再试一次请发 /image-retry。"
+        )
+    if detail == "extended":
+        return (
+            "又等了 5 分钟，仍然没有结果。已停止观察，没有重新生图。"
+            "继续等不能再取回结果。若要重新生成请发 /image-retry，原来的请求可能已经计费。"
+        )
+    if detail == "silence":
+        return (
+            "5 分钟内没有选择，已停止观察这条请求，没有重新生图。"
+            "继续等不能再取回结果。若要重新生成请发 /image-retry，原来的请求可能已经计费。"
+        )
+    if detail == "retried":
+        return (
+            "已开始一次新的生图。上一条请求如果仍在服务端处理，可能已经计费，它的结果不会当作这次的图。"
+        )
+    return (
+        "没能确认服务端是否已经处理这条请求，所以不能把它说成失败，也没有自动重试。"
+        "原来的连接已经结束，继续等不能取回结果。服务端没有查询接口，重启后也不能补回这次结果。"
+        "若要重新生成请发 /image-retry，这会新开一次请求，原来的请求可能已经计费。"
+    )
+
+
+def _artifact_paths(result: object) -> list[str]:
+    if not isinstance(result, str):
+        return []
+    try:
+        parsed = _json_object(result)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    paths: list[str] = []
+    artifacts = parsed.get("artifacts")
+    rows = cast(list[object], artifacts) if isinstance(artifacts, list) else []
+    for item in rows:
+        artifact = _as_object(item)
+        if artifact is None:
+            continue
+        artifact_path = artifact.get("path")
+        if isinstance(artifact_path, str) and artifact_path:
+            paths.append(artifact_path)
+    return paths
+
+
+def _safe_detail(text: str) -> str:
+    return public_image_reason(RuntimeError(text.removeprefix("Error:").strip()))
+
+
 class ImageQueue:
     """FIFO image drafts owned by the gateway process."""
 
@@ -117,12 +195,14 @@ class ImageQueue:
         debounce: float = DEBOUNCE,
         provider_timeout: float = PROVIDER_TIMEOUT,
         delivery_timeout: float = DELIVERY_TIMEOUT,
+        watch_extend: float = WATCH_EXTEND,
     ) -> None:
         self.loop = loop
         self.clock = clock
         self.debounce = debounce
         self.provider_timeout = provider_timeout
         self.delivery_timeout = delivery_timeout
+        self.watch_extend = watch_extend
         self.root = Path(root) if root is not None else get_data_dir() / "image-queue"
         self._prepare_dir(self.root)
         self.refs = self.root / "refs"
@@ -133,6 +213,7 @@ class ImageQueue:
         self.by_session: dict[str, dict[str, None]] = {}
         self.deferred: set[str] = set()
         self.pump: asyncio.Task[None] | None = None
+        self.decision = asyncio.Event()
         self._background: dict[str, set[asyncio.Task[Any]]] = {}
         self._owner = FileLock(str(self.root / "owner.lock"))
         try:
@@ -152,13 +233,29 @@ class ImageQueue:
                             'draft','running','done','unknown','cancelled','failed','acknowledged'
                         )),
                         due REAL NOT NULL, changed REAL NOT NULL, cancelled INTEGER NOT NULL DEFAULT 0,
-                        paths TEXT NOT NULL DEFAULT '[]', notice INTEGER NOT NULL DEFAULT 0)"""
+                        paths TEXT NOT NULL DEFAULT '[]', notice INTEGER NOT NULL DEFAULT 0,
+                        delivery_error INTEGER NOT NULL DEFAULT 0,
+                        watch_until REAL NOT NULL DEFAULT 0,
+                        prompted INTEGER NOT NULL DEFAULT 0,
+                        extensions INTEGER NOT NULL DEFAULT 0,
+                        superseded INTEGER NOT NULL DEFAULT 0,
+                        prompt_error INTEGER NOT NULL DEFAULT 0,
+                        detail TEXT NOT NULL DEFAULT '',
+                        retry_of TEXT)"""
                 )
                 columns = {str(row[1]) for row in db.execute("PRAGMA table_info(jobs)")}
-                if "delivery_error" not in columns:
-                    db.execute(
-                        "ALTER TABLE jobs ADD COLUMN delivery_error INTEGER NOT NULL DEFAULT 0"
-                    )
+                for name, ddl in (
+                    ("delivery_error", "delivery_error INTEGER NOT NULL DEFAULT 0"),
+                    ("watch_until", "watch_until REAL NOT NULL DEFAULT 0"),
+                    ("prompted", "prompted INTEGER NOT NULL DEFAULT 0"),
+                    ("extensions", "extensions INTEGER NOT NULL DEFAULT 0"),
+                    ("superseded", "superseded INTEGER NOT NULL DEFAULT 0"),
+                    ("prompt_error", "prompt_error INTEGER NOT NULL DEFAULT 0"),
+                    ("detail", "detail TEXT NOT NULL DEFAULT ''"),
+                    ("retry_of", "retry_of TEXT"),
+                ):
+                    if name not in columns:
+                        db.execute(f"ALTER TABLE jobs ADD COLUMN {ddl}")
                 db.execute("DROP INDEX IF EXISTS one_paid_call_per_session")
                 db.execute(
                     """CREATE UNIQUE INDEX one_paid_call_per_session
@@ -276,7 +373,7 @@ class ImageQueue:
             lines.extend((
                 f"Image queue in this conversation: {', '.join(states)}.",
                 "If the current input adds or changes image requirements, use generate_image status and update the full draft. If clarification is needed, hold the draft with defer before asking.",
-                "Do not queue a new image for unrelated chat. A running image cannot be changed. status.unconfirmed_call means that call must not be retried; it does not block a later draft.",
+                "Do not queue a new image for unrelated chat. A running image cannot be changed. Do not call the provider again for an unconfirmed call. Only the user can send /image-wait or /image-retry; do not send either yourself.",
             ))
         if undelivered:
             lines.append(
@@ -303,6 +400,7 @@ class ImageQueue:
             or automation_history_overrides(meta)[1]
             or self.loop.commands.is_priority(stripped)
             or self.loop.commands.is_dispatchable_command(stripped)
+            or stripped.lower() in _IMAGE_CHOICES
         ):
             return
         key = msg.session_key
@@ -407,6 +505,7 @@ class ImageQueue:
             worker.cancel()
         for task in tuple(self._background.get(key, ())):
             task.cancel()
+        self.decision.set()
         for token in self.by_session.pop(key, {}):
             self.inputs.pop(token, None)
             self.deferred.discard(token)
@@ -422,6 +521,9 @@ class ImageQueue:
         if command in {"/stop", "/new"} and isinstance(raw, str):
             msg.content = command
             return False
+        if command in _IMAGE_CHOICES:
+            await self._answer_choice(msg, key, command)
+            return True
         token = msg.metadata.get(TOKEN_KEY)
         record = self.inputs.get(token) if isinstance(token, str) else None
         if command != "/image-resume" or record is None:
@@ -455,7 +557,8 @@ class ImageQueue:
     def status(self, key: str, generation: str) -> dict[str, Any]:
         with self._tx() as db:
             jobs = db.execute(
-                """SELECT id, version, state, mergeable, cancelled, delivery_error, notice, params, paths FROM jobs
+                """SELECT id, version, state, mergeable, cancelled, delivery_error, notice,
+                          prompt_error, extensions, detail, params, paths FROM jobs
                    WHERE session=? AND generation=?
                    ORDER BY CASE WHEN state IN ('draft','running','unknown') THEN 0 ELSE 1 END,
                    rowid DESC LIMIT 18""",
@@ -480,6 +583,9 @@ class ImageQueue:
                 "cancelled": int(job["cancelled"]),
                 "delivery_error": int(job["delivery_error"]),
                 "notice": int(job["notice"]),
+                "prompt_error": int(job["prompt_error"]),
+                "extensions": int(job["extensions"]),
+                "detail": str(job["detail"] or ""),
                 "paths": _json_strings(str(job["paths"] or "[]")),
             }
             row.update({name: value for name, value in params.items() if name != "reference_images"})
@@ -701,67 +807,31 @@ class ImageQueue:
         prompt = params.get("prompt")
         aspect_ratio = params.get("aspect_ratio")
         image_size = params.get("image_size")
+        self._arm_watch(selected)
         call = asyncio.create_task(
-            tool.generate_now(
+            self._invoke_provider(
+                tool,
                 prompt if isinstance(prompt, str) else "",
                 refs,
                 aspect_ratio if isinstance(aspect_ratio, str) else None,
                 image_size if isinstance(image_size, str) else None,
                 count,
-                references_are_resolved=True,
             )
         )
-        self._track(str(selected["session"]), call)
+        self._track(str(selected["session"]), call, str(selected["id"]))
         try:
-            done, _pending = await asyncio.wait({call}, timeout=self.provider_timeout)
+            await self._watch(call, str(selected["id"]))
         except asyncio.CancelledError:
             call.cancel()
             self._settle(selected, "unknown")
             raise
-        if call not in done:
-            call.cancel()
-            logger.warning("Image provider call timed out")
-            self._settle(selected, "unknown")
-            return
-        try:
-            result = call.result()
-        except asyncio.CancelledError:
-            self._settle(selected, "unknown")
-            raise
-        except Exception as exc:
-            logger.warning("Image provider call has no confirmed result: {}", type(exc).__name__)
-            self._settle(selected, "unknown")
-            return
-        try:
-            parsed = _json_object(result)
-            paths: list[str] = []
-            artifacts = parsed.get("artifacts")
-            artifact_rows = cast(list[object], artifacts) if isinstance(artifacts, list) else []
-            for item in artifact_rows:
-                artifact = _as_object(item)
-                if artifact is None:
-                    continue
-                artifact_path = artifact.get("path")
-                if isinstance(artifact_path, str) and artifact_path:
-                    paths.append(artifact_path)
-            if not paths:
-                raise ValueError("no artifact paths")
-        except Exception as exc:
-            logger.warning("Image provider call has no confirmed result: {}", type(exc).__name__)
-            self._settle(selected, "unknown")
-        else:
-            self._settle(selected, "done", paths)
 
     async def notice(self, job: sqlite3.Row) -> None:
         if not await self._header_ok(job):
             self._mark_notice(job, error=False)
             return
         paths = _json_strings(str(job["paths"] or "[]"))
-        text = {
-            "done": "图画好了。",
-            "failed": "草稿没发出：生图设置或参考图已变更。",
-            "unknown": "上一份生图没有确认结果，已经停止，不会自动重发。新的生图请求可以继续。要清掉这条未确认记录，可以发 /image-resume。",
-        }[str(job["state"])]
+        text = _terminal_text(str(job["state"]), str(job["detail"] or ""))
         metadata: dict[str, Any] = {
             "_record_channel_delivery": True,
             "_session_key": str(job["session"]),
@@ -882,23 +952,28 @@ class ImageQueue:
             and session.policy.log_content
         )
 
-    def _settle(self, job: sqlite3.Row, state: str, paths: list[str] | None = None) -> None:
+    def _settle(
+        self,
+        job: sqlite3.Row,
+        state: str,
+        paths: list[str] | None = None,
+        detail: str | None = None,
+    ) -> None:
         saved_paths = paths or []
+        assignments = (
+            "state=CASE WHEN cancelled=1 THEN 'cancelled' ELSE ? END, "
+            "paths=CASE WHEN cancelled=1 THEN '[]' ELSE ? END, "
+            "changed=?, notice=cancelled"
+        )
+        values: list[Any] = [state, json.dumps(saved_paths), self._now()]
+        if detail is not None:
+            assignments += ", detail=?"
+            values.append(detail)
+        values.extend((str(job["id"]), str(job["state"]), int(job["version"])))
         with self._tx() as db:
             db.execute(
-                """UPDATE jobs SET
-                   state=CASE WHEN cancelled=1 THEN 'cancelled' ELSE ? END,
-                   paths=CASE WHEN cancelled=1 THEN '[]' ELSE ? END,
-                   changed=?, notice=cancelled
-                   WHERE id=? AND state=? AND version=?""",
-                (
-                    state,
-                    json.dumps(saved_paths),
-                    self._now(),
-                    str(job["id"]),
-                    str(job["state"]),
-                    int(job["version"]),
-                ),
+                f"UPDATE jobs SET {assignments} WHERE id=? AND state=? AND version=?",
+                tuple(values),
             )
 
     def _hold(
@@ -933,6 +1008,389 @@ class ImageQueue:
             (key, generation),
         )
 
+    async def _invoke_provider(
+        self,
+        tool: ImageGenerationTool,
+        prompt: str,
+        refs: list[str],
+        aspect_ratio: str | None,
+        image_size: str | None,
+        count: int,
+    ) -> str:
+        token = image_http_timeout.set(self.provider_timeout + (2 * self.watch_extend))
+        try:
+            return await tool.generate_now(
+                prompt,
+                refs,
+                aspect_ratio,
+                image_size,
+                count,
+                references_are_resolved=True,
+                propagate_provider_errors=True,
+            )
+        finally:
+            image_http_timeout.reset(token)
+
+    async def _watch(self, call: asyncio.Task[str], job_id: str) -> None:
+        while True:
+            row = self._job(job_id)
+            if (
+                row is None
+                or str(row["state"]) != "running"
+                or int(row["cancelled"])
+                or int(row["superseded"])
+            ):
+                call.cancel()
+                return
+            if call.done():
+                self._record_call_outcome(call, job_id)
+                return
+            remaining = float(row["watch_until"]) - self._now()
+            if remaining <= 0:
+                action = self._advance_watch(job_id)
+                if action == "prompt":
+                    await self._deliver_prompt(job_id)
+                    continue
+                if action == "wait":
+                    continue
+                if action != "close":
+                    call.cancel()
+                    return
+                fresh = self._job(job_id)
+                if fresh is None or str(fresh["state"]) != "running":
+                    call.cancel()
+                    return
+                kind = "extended" if int(fresh["extensions"]) else "silence"
+                call.cancel()
+                if call.done() and not call.cancelled():
+                    self._record_call_outcome(call, job_id)
+                    return
+                self._settle(fresh, "unknown", detail=kind)
+                return
+            self.decision.clear()
+            waiter = asyncio.create_task(self.decision.wait())
+            try:
+                await asyncio.wait({call, waiter}, timeout=min(max(remaining, 0.0), 1.0))
+            finally:
+                waiter.cancel()
+                with suppress(asyncio.CancelledError):
+                    await waiter
+
+    def _arm_watch(self, job: sqlite3.Row) -> None:
+        with self._tx() as db:
+            db.execute(
+                """UPDATE jobs SET watch_until=?
+                   WHERE id=? AND state='running' AND watch_until=0""",
+                (self._now() + self.provider_timeout, str(job["id"])),
+            )
+
+    def _advance_watch(self, job_id: str) -> str:
+        now = self._now()
+        with self._tx() as db:
+            row = db.execute(
+                """SELECT prompted, extensions, state, superseded, cancelled, watch_until
+                   FROM jobs WHERE id=?""",
+                (job_id,),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["state"]) != "running"
+                or int(row["superseded"])
+                or int(row["cancelled"])
+            ):
+                return "stop"
+            if float(row["watch_until"]) > now:
+                return "wait"
+            if int(row["prompted"]) == 0:
+                db.execute(
+                    """UPDATE jobs SET prompted=1, watch_until=?
+                       WHERE id=? AND state='running' AND prompted=0""",
+                    (now + self.watch_extend, job_id),
+                )
+                return "prompt"
+            return "close"
+
+    def _job(self, job_id: str) -> sqlite3.Row | None:
+        with self._tx() as db:
+            return db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+
+    def _record_call_outcome(self, call: asyncio.Task[str], job_id: str) -> None:
+        if not call.done() or call.cancelled():
+            return
+        try:
+            exc = call.exception()
+        except asyncio.CancelledError:
+            return
+        if isinstance(exc, ImageRequestRejectedError):
+            self._claim_terminal(job_id, "failed", detail=exc.reason)
+            return
+        if exc is not None:
+            logger.warning("Image provider call has no confirmed result: {}", type(exc).__name__)
+            self._claim_terminal(job_id, "unknown")
+            return
+        result = call.result()
+        paths = _artifact_paths(result)
+        if paths:
+            self._claim_terminal(job_id, "done", paths=paths)
+            return
+        if isinstance(result, ToolResult) and result.is_error:
+            self._claim_terminal(job_id, "failed", detail=_safe_detail(str(result)))
+            return
+        self._claim_terminal(job_id, "unknown")
+
+    def _claim_terminal(
+        self,
+        job_id: str,
+        state: str,
+        paths: list[str] | None = None,
+        detail: str = "",
+    ) -> None:
+        with self._tx() as db:
+            db.execute(
+                """UPDATE jobs SET state=?, paths=?, detail=?, changed=?, notice=0
+                   WHERE id=? AND state='running' AND cancelled=0 AND superseded=0""",
+                (state, json.dumps(paths or []), detail, self._now(), job_id),
+            )
+
+    async def _deliver_prompt(self, job_id: str) -> None:
+        row = self._job(job_id)
+        if row is None or str(row["state"]) != "running":
+            return
+        try:
+            await self._send(row, _soft_prompt(self.provider_timeout, self.watch_extend), [])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Image wait prompt was not delivered: {}", type(exc).__name__)
+            with self._tx() as db:
+                db.execute("UPDATE jobs SET prompt_error=1 WHERE id=?", (job_id,))
+
+    async def _send(self, job: sqlite3.Row, text: str, media: list[str]) -> None:
+        metadata: dict[str, Any] = {
+            "_record_channel_delivery": True,
+            "_session_key": str(job["session"]),
+            "_session_generation": str(job["generation"]),
+        }
+        message_id = job["message_id"]
+        if isinstance(message_id, str) and message_id:
+            metadata["message_id"] = message_id
+        if str(job["channel"]) == "websocket":
+            metadata[HISTORY_GENERATION_METADATA_KEY] = str(job["generation"])
+        call = asyncio.create_task(
+            deliver_to_channel(
+                OutboundMessage(
+                    str(job["channel"]),
+                    str(job["chat"]),
+                    text,
+                    media=media,
+                    metadata=metadata,
+                    delivery=DeliveryRequest(
+                        "image-" + str(job["id"]),
+                        str(job["session"]),
+                        str(job["generation"]),
+                    ),
+                ),
+                bus=self.loop.bus,
+                session_manager=self.loop.sessions,
+            )
+        )
+        try:
+            done, _pending = await asyncio.wait({call}, timeout=self.delivery_timeout)
+        except asyncio.CancelledError:
+            call.cancel()
+            raise
+        if call not in done:
+            call.cancel()
+            raise TimeoutError("image delivery timed out")
+        call.result()
+
+    async def _answer_choice(self, msg: InboundMessage, key: str, command: str) -> None:
+        header = await self.loop.sessions.state.read_header(key)
+        generation = header.generation if header is not None else msg.session_generation
+        if not isinstance(generation, str) or not generation:
+            text = "没有可操作的生图请求。"
+            generation = ""
+        elif command == "/image-wait":
+            text = self.choose_wait(key, generation)
+        else:
+            text = self.choose_retry(key, generation)
+        try:
+            await self._send_chat(msg, key, generation, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Image choice was not delivered: {}", type(exc).__name__)
+            self._note_prompt_error(key, generation)
+
+    async def _send_chat(self, msg: InboundMessage, key: str, generation: str, text: str) -> None:
+        metadata: dict[str, Any] = {"_record_channel_delivery": True, "_session_key": key}
+        if generation:
+            metadata["_session_generation"] = generation
+        if msg.channel == "websocket" and generation:
+            metadata[HISTORY_GENERATION_METADATA_KEY] = generation
+        message_id = msg.metadata.get("message_id")
+        if isinstance(message_id, str) and message_id:
+            metadata["message_id"] = message_id
+        call = asyncio.create_task(
+            deliver_to_channel(
+                OutboundMessage(
+                    msg.channel,
+                    msg.chat_id,
+                    text,
+                    metadata=metadata,
+                    delivery=DeliveryRequest("image-choice-" + (message_id or key), key, generation or "none"),
+                ),
+                bus=self.loop.bus,
+                session_manager=self.loop.sessions,
+            )
+        )
+        try:
+            done, _pending = await asyncio.wait({call}, timeout=self.delivery_timeout)
+        except asyncio.CancelledError:
+            call.cancel()
+            raise
+        if call not in done:
+            call.cancel()
+            raise TimeoutError("image choice delivery timed out")
+        call.result()
+
+    def choose_wait(self, key: str, generation: str) -> str:
+        closed = (
+            "这条请求已经不在观察中。继续等不能取回结果，也没有重新生图。"
+            "服务端没有查询接口，重启或停止观察后不能补回原来的结果。"
+            "若要重新生成请发 /image-retry，这可能重复计费。"
+        )
+        if key not in self.workers:
+            return closed
+        now = self._now()
+        with self._tx() as db:
+            row = db.execute(
+                """SELECT id, prompted, extensions FROM jobs
+                   WHERE session=? AND generation=? AND state='running'
+                     AND superseded=0 AND cancelled=0
+                   ORDER BY rowid DESC LIMIT 1""",
+                (key, generation),
+            ).fetchone()
+            if row is None:
+                return closed
+            if int(row["prompted"]) == 0:
+                return "这条请求还在第一次等待中，没有重新生图。"
+            if int(row["extensions"]) >= 1:
+                return "已经在多等这条请求，不会重新生图。"
+            db.execute(
+                """UPDATE jobs SET extensions=1, watch_until=?
+                   WHERE id=? AND state='running' AND extensions=0""",
+                (now + self.watch_extend, str(row["id"])),
+            )
+        self.decision.set()
+        return f"继续观察同一条请求 {_span(self.watch_extend)}，不会重新生图。"
+
+    def choose_retry(self, key: str, generation: str) -> str:
+        accepted = "已经接受重新生成，不用重复发送。"
+        started = (
+            "已开始一次新的生图。上一条请求如果仍在服务端处理，可能已经计费，它的结果不会当作这次的图。"
+        )
+        finished = "上一条生图已经完成，没有重新生成。"
+        nothing = "没有可重试的生图请求。"
+        now = self._now()
+        launch = False
+        with self._tx() as db:
+            newest = db.execute(
+                """SELECT * FROM jobs WHERE session=? AND generation=?
+                   ORDER BY rowid DESC LIMIT 1""",
+                (key, generation),
+            ).fetchone()
+            if newest is None or not newest["params"]:
+                return nothing
+            state = str(newest["state"])
+            if state in {"draft", "running"} and newest["retry_of"]:
+                return accepted
+            if state == "done":
+                return finished
+            if state == "cancelled" or int(newest["cancelled"]):
+                return nothing
+            if state == "running":
+                replaced = db.execute(
+                    """UPDATE jobs SET state='unknown', superseded=1, notice=1, detail='retried', changed=?
+                       WHERE id=? AND state='running' AND superseded=0 AND cancelled=0""",
+                    (now, str(newest["id"])),
+                ).rowcount
+                if replaced:
+                    self._insert_retry(db, newest, now)
+                    launch = True
+                else:
+                    current = db.execute(
+                        "SELECT * FROM jobs WHERE id=?",
+                        (str(newest["id"]),),
+                    ).fetchone()
+                    if current is None or not current["params"]:
+                        return nothing
+                    if str(current["state"]) == "done":
+                        return finished
+                    if str(current["state"]) == "running" or int(current["cancelled"]):
+                        return accepted if int(current["superseded"]) or current["retry_of"] else nothing
+                    newest = current
+                    state = str(current["state"])
+            if not launch and state in {"failed", "unknown"} and not int(newest["superseded"]):
+                origin = f"retry:{newest['id']}"
+                existing = db.execute(
+                    """SELECT job FROM submissions
+                       WHERE session=? AND generation=? AND origin=?""",
+                    (key, generation, origin),
+                ).fetchone()
+                if existing is not None:
+                    return accepted
+                self._insert_retry(db, newest, now)
+                launch = True
+            elif not launch:
+                return nothing
+        for task in tuple(self._background.get(key, ())):
+            task.cancel()
+        self.decision.set()
+        self.wake.set()
+        return started
+
+    def _insert_retry(self, db: sqlite3.Connection, source: sqlite3.Row, now: float) -> None:
+        job = uuid4().hex
+        origin = f"retry:{source['id']}"
+        db.execute(
+            "INSERT INTO submissions VALUES (?, ?, ?, ?, ?)",
+            (str(source["session"]), str(source["generation"]), origin, job, now),
+        )
+        db.execute(
+            """INSERT INTO jobs (
+                id, session, generation, channel, chat, message_id, provider, model,
+                params, version, mergeable, state, due, changed, retry_of
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 'draft', ?, ?, ?)""",
+            (
+                job,
+                str(source["session"]),
+                str(source["generation"]),
+                str(source["channel"]),
+                str(source["chat"]),
+                source["message_id"],
+                str(source["provider"]),
+                str(source["model"]),
+                str(source["params"]),
+                now,
+                now,
+                str(source["id"]),
+            ),
+        )
+
+    def _note_prompt_error(self, key: str, generation: str) -> None:
+        if not generation:
+            return
+        with self._tx() as db:
+            db.execute(
+                """UPDATE jobs SET prompt_error=1
+                   WHERE id=(
+                       SELECT id FROM jobs WHERE session=? AND generation=?
+                       ORDER BY rowid DESC LIMIT 1
+                   )""",
+                (key, generation),
+            )
+
     def _mark_notice(self, job: sqlite3.Row, *, error: bool) -> None:
         with self._tx() as db:
             db.execute(
@@ -965,12 +1423,14 @@ class ImageQueue:
                         (now, str(row["id"])),
                     )
 
-    def _track(self, key: str, task: asyncio.Task[Any]) -> None:
+    def _track(self, key: str, task: asyncio.Task[Any], job_id: str | None = None) -> None:
         bucket = self._background.setdefault(key, set())
         bucket.add(task)
 
-        def _drop(done: asyncio.Task[Any], session_key: str = key) -> None:
-            if not done.cancelled():
+        def _drop(done: asyncio.Task[Any], session_key: str = key, tracked_job: str | None = job_id) -> None:
+            if tracked_job is not None:
+                self._record_call_outcome(done, tracked_job)
+            elif not done.cancelled():
                 done.exception()
             tasks = self._background.get(session_key)
             if tasks is None:
