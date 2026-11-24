@@ -119,14 +119,13 @@ def _span(seconds: float) -> str:
     return f"{minutes} 分钟"
 
 
-def _soft_prompt(waited: float, extend: float) -> str:
+def _soft_prompt(waited: float) -> str:
     waited_text = _span(waited)
-    extend_text = _span(extend)
     return (
         f"已经等了 {waited_text}，这条请求可能还在生成。我没有把它当成失败，也没有重新发送。"
-        f"直接说再等 {extend_text}，我会继续看同一条请求，不会重新生图。"
-        f"重新生成是另一次请求，原来的可能已经计费。"
-        f"如果 {extend_text}内不说，我将停止观察，之后不能再等回结果。"
+        "直接说再等，我会继续看同一条请求，不会重新生图。"
+        "重新生成是另一次请求，原来的可能已经计费。"
+        "如果接下来不再说，我会停止观察，之后不能再等回结果。"
     )
 
 
@@ -137,17 +136,17 @@ def _terminal_text(state: str, detail: str) -> str:
         reason = detail or "生图设置或参考图已变更"
         return (
             f"生图失败：{reason}。这是已经返回的结果，不是超时。"
-            "没有自动重试。若要再试一次请发 /image-retry。"
+            "没有自动重试。若要再试一次，直接说要重试。"
         )
     if detail == "extended":
         return (
-            "又等了 5 分钟，仍然没有结果。已停止观察，没有重新生图。"
-            "继续等不能再取回结果。若要重新生成请发 /image-retry，原来的请求可能已经计费。"
+            "又等了一段时间，仍然没有结果。已停止观察，没有重新生图。"
+            "继续等不能再取回结果。若要重新生成，直接说要重试；原来的请求可能已经计费。"
         )
     if detail == "silence":
         return (
-            "5 分钟内没有选择，已停止观察这条请求，没有重新生图。"
-            "继续等不能再取回结果。若要重新生成请发 /image-retry，原来的请求可能已经计费。"
+            "这段时间内没有选择，已停止观察这条请求，没有重新生图。"
+            "继续等不能再取回结果。若要重新生成，直接说要重试；原来的请求可能已经计费。"
         )
     if detail == "retried":
         return (
@@ -156,7 +155,7 @@ def _terminal_text(state: str, detail: str) -> str:
     return (
         "没能确认服务端是否已经处理这条请求，所以不能把它说成失败，也没有自动重试。"
         "原来的连接已经结束，继续等不能取回结果。服务端没有查询接口，重启后也不能补回这次结果。"
-        "若要重新生成请发 /image-retry，这会新开一次请求，原来的请求可能已经计费。"
+        "若要重新生成，直接说要重试。这会新开一次请求，原来的请求可能已经计费。"
     )
 
 
@@ -356,7 +355,8 @@ class ImageQueue:
             with self._tx() as db:
                 rows = db.execute(
                     """SELECT DISTINCT state FROM jobs
-                       WHERE session=? AND generation=? AND state IN ('draft','running','unknown')""",
+                       WHERE session=? AND generation=?
+                         AND state IN ('draft','running','unknown','failed')""",
                     (record.key, ctx.session_generation),
                 ).fetchall()
                 undelivered = db.execute(
@@ -374,7 +374,7 @@ class ImageQueue:
             lines.extend((
                 f"Image queue in this conversation: {', '.join(states)}.",
                 "If the current input adds or changes image requirements, use generate_image status and update the full draft. If clarification is needed, hold the draft with defer before asking.",
-                "Do not queue a new image for unrelated chat. A running image cannot be changed. Do not call the provider again for an unconfirmed call. If the user asks to keep waiting, call generate_image with queue_mode=wait. That keeps the same provider call and does not generate again. Do not send /image-wait yourself.",
+                "Do not queue a new image for unrelated chat. A running image cannot be changed. Do not call the provider again for an unconfirmed call. If the user asks to keep waiting, call generate_image with queue_mode=wait. That keeps the same provider call and does not generate again. If the user asks to try again, call queue_mode=retry. That starts one new attempt; say that an unknown or still-running original may already have been billed. Do not send /image-wait or /image-retry yourself.",
             ))
         if undelivered:
             lines.append(
@@ -1162,7 +1162,7 @@ class ImageQueue:
         if row is None or str(row["state"]) != "running":
             return
         try:
-            await self._send(row, _soft_prompt(self.provider_timeout, self.watch_extend), [])
+            await self._send(row, _soft_prompt(self.provider_timeout), [])
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1263,7 +1263,7 @@ class ImageQueue:
         closed = (
             "这条请求已经不在观察中。继续等不能取回结果，也没有重新生图。"
             "服务端没有查询接口，重启或停止观察后不能补回原来的结果。"
-            "若要重新生成请发 /image-retry，这可能重复计费。"
+            "若要重新生成，直接说要重试。这可能重复计费。"
         )
         if key not in self.workers:
             return closed
@@ -1288,7 +1288,7 @@ class ImageQueue:
                 (now + self.watch_extend, str(row["id"])),
             )
         self.decision.set()
-        return f"继续观察同一条请求 {_span(self.watch_extend)}，不会重新生图。"
+        return "继续观察同一条请求，不会重新生图。"
 
     def choose_retry(self, key: str, generation: str) -> str:
         accepted = "已经接受重新生成，不用重复发送。"
@@ -1539,6 +1539,8 @@ async def handle_image_request(
             return json.dumps(queue.status(record.key, generation), ensure_ascii=False)
         if mode == "wait":
             return queue.choose_wait(record.key, generation)
+        if mode == "retry":
+            return queue.choose_retry(record.key, generation)
         if mode == "defer":
             return queue.defer(record, generation)
         if mode == "recover":

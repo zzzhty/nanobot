@@ -641,7 +641,7 @@ async def test_second_wait_stops_without_another_call(tmp_path: Path, monkeypatc
         await _until(lambda: _rows(queue.root)[0]["state"] == "unknown", timeout=3)
         assert _rows(queue.root)[0]["detail"] == "extended"
         assert tool.calls == ["one"]
-        assert any("又等了" in str(item["content"]) for item in notes)
+        await _until(lambda: any("又等了" in str(item["content"]) for item in notes), timeout=3)
         assert await queue.intercept(_command("/image-wait", generation), "qq:group-a") is True
         await _until(lambda: any("不在观察中" in str(item["content"]) for item in notes), timeout=3)
         assert tool.calls == ["one"]
@@ -663,7 +663,7 @@ async def test_silence_stops_the_same_call(tmp_path: Path, monkeypatch: pytest.M
         await _nudge(queue, clock, 300)
         await _until(lambda: _rows(queue.root)[0]["detail"] == "silence", timeout=3)
         assert tool.calls == ["one"]
-        assert any("没有选择" in str(item["content"]) for item in notes)
+        await _until(lambda: any("没有选择" in str(item["content"]) for item in notes), timeout=3)
         _submit(queue, "two", "m-2", tool, generation)
         await _until(lambda: tool.calls == ["one", "two"], timeout=3)
     finally:
@@ -682,7 +682,8 @@ async def test_confirmed_failure_asks_for_one_retry(tmp_path: Path, monkeypatch:
         await _until(lambda: any("生图失败" in str(item["content"]) for item in notes), timeout=3)
         failure = next(item for item in notes if "生图失败" in str(item["content"]))
         assert "内容审核未通过" in str(failure["content"])
-        assert "/image-retry" in str(failure["content"])
+        assert "直接说要重试" in str(failure["content"])
+        assert "/image-retry" not in str(failure["content"])
         assert "可能还在生成" not in str(failure["content"])
         assert "不能把它说成失败" not in str(failure["content"])
         assert "没有可重试" in queue.choose_retry("qq:group-a", "other-generation")
@@ -712,6 +713,10 @@ async def test_unknown_retry_is_a_new_call_and_a_duplicate_is_ignored(
         assert "connection reset" not in str(notice["content"])
         assert "生图失败" not in str(notice["content"])
         assert "/image-wait" not in str(notice["content"])
+        assert "/image-retry" not in str(notice["content"])
+        assert "可能已经计费" in str(notice["content"])
+        assert "直接说要重试" in str(notice["content"])
+        assert "不能取回" in str(notice["content"])
         assert await queue.intercept(_command("/image-retry", generation), "qq:group-a") is True
         await _until(lambda: tool.calls == ["one", "one"], timeout=3)
         assert any("可能已经计费" in str(item["content"]) for item in notes)

@@ -111,11 +111,14 @@ def _queue_parameters() -> dict[str, Any]:
     properties["queue_mode"] = StringSchema(
         "For the gateway queue: status to inspect drafts; merge (default) with a full updated brief; "
         "new for a separate image; recover to read interrupted inputs; defer to hold a draft for clarification; "
-        "wait to keep observing the same running provider call. "
-        "wait does not generate again and does not start a billed retry. "
+        "wait to keep observing the same running provider call; "
+        "retry to start one new attempt after the user asks to try again. "
+        "wait does not generate again. retry does not recover the original connection, "
+        "and an unknown or still-running original may already have been billed. "
+        "The extra observation time is an internal limit, not a duration the user has to name. "
         "status.can_wait is false when that call has finished, was cancelled, or the process restarted. "
         "An unconfirmed provider call is not retried and does not block a later draft.",
-        enum=["status", "merge", "new", "recover", "defer", "wait"],
+        enum=["status", "merge", "new", "recover", "defer", "wait", "retry"],
     ).to_json_schema()
     properties["draft_id"] = StringSchema(
         "ID from status. A draft is edited; a frozen image may seed the next draft.",
@@ -174,7 +177,8 @@ class ImageGenerationTool(Tool):
                 "The gateway delivers those results later. On every other turn, generate the image immediately. "
                 "Use status before modifying a pending image. Do not claim completion or submit twice. "
                 "Use new only for a separate request. "
-                "If the user asks to keep waiting for an image that is already running, use queue_mode=wait."
+                "If the user asks to keep waiting for an image that is already running, use queue_mode=wait. "
+                "If the user asks to try that image again, use queue_mode=retry and say when the original may already have been billed."
             )
         return (
             "Generate or edit images as persistent artifacts. Returns artifact IDs and local paths."
