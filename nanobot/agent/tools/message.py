@@ -17,21 +17,54 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.config.paths import get_workspace_path
 from nanobot.security.workspace_access import current_tool_workspace
 
-_CURRENT_MESSAGE_SENDS: ContextVar[set[tuple[str, str]] | None] = ContextVar(
+_CURRENT_MESSAGE_SENDS: ContextVar[dict[tuple[str, str], list[str]] | None] = ContextVar(
     "message_sends",
     default=None,
 )
 
 
 @contextmanager
-def capture_message_deliveries() -> Generator[set[tuple[str, str]], None, None]:
-    """Record successful MessageTool targets within one agent run."""
-    sends: set[tuple[str, str]] = set()
+def capture_message_deliveries() -> Generator[dict[tuple[str, str], list[str]], None, None]:
+    """Record queued MessageTool content per target within one agent run."""
+    sends: dict[tuple[str, str], list[str]] = {}
     token = _CURRENT_MESSAGE_SENDS.set(sends)
     try:
         yield sends
     finally:
         _CURRENT_MESSAGE_SENDS.reset(token)
+
+
+def duplicate_final_should_suppress(
+    sends: dict[tuple[str, str], list[str]],
+    *,
+    channel: str,
+    chat_id: str,
+    final_content: str | None,
+    stop_reason: str,
+    had_injections: bool,
+) -> bool:
+    """Hide a final reply that repeats a message already queued in this turn.
+
+    QQ suppresses only an exact completed reply. Other channels keep the
+    upstream rule: any tool send to the same target suppresses the final text,
+    including the empty-reply fallback.
+    """
+    if channel == "qq":
+        target = chat_id.removeprefix("qq:")
+        sent = [
+            text
+            for (sent_channel, sent_chat), texts in sends.items()
+            if sent_channel == "qq" and sent_chat.removeprefix("qq:") == target
+            for text in texts
+        ]
+        if had_injections or stop_reason != "completed":
+            return False
+        if final_content is None or not final_content.strip():
+            return False
+        return any(text.strip() == final_content.strip() for text in sent)
+    return (channel, chat_id) in sends and (
+        not had_injections or stop_reason == "empty_final_response"
+    )
 
 
 @tool_parameters(
@@ -181,6 +214,8 @@ class MessageTool(Tool):
         )
         channel = channel or default_channel
         explicit_chat_id = chat_id
+        if channel == "qq" and isinstance(chat_id, str) and chat_id.startswith("qq:"):
+            chat_id = chat_id.removeprefix("qq:")
         if (
             default_channel == "websocket"
             and channel == "websocket"
@@ -195,6 +230,10 @@ class MessageTool(Tool):
                 "(e.g. anon-…) are not chat ids."
             )
         chat_id = chat_id or default_chat_id
+        if channel == "qq" and chat_id.startswith("qq:"):
+            chat_id = chat_id.removeprefix("qq:")
+        if channel == "qq" and default_chat_id.startswith("qq:"):
+            default_chat_id = default_chat_id.removeprefix("qq:")
         # Only inherit default message_id when targeting the same channel+chat.
         # Cross-chat sends must not carry the original message_id, because
         # some channels (e.g. Feishu) use it to determine the target
@@ -221,7 +260,7 @@ class MessageTool(Tool):
         metadata = dict(default_metadata) if same_target else {}
         if message_id:
             metadata["message_id"] = message_id
-        if media:
+        if media or not same_target:
             metadata["_record_channel_delivery"] = True
         if same_target and request_ctx is not None and request_ctx.session_generation is not None:
             metadata["_session_key"] = request_ctx.session_key
@@ -247,7 +286,7 @@ class MessageTool(Tool):
             await self._send_callback(msg)
             sends = _CURRENT_MESSAGE_SENDS.get()
             if sends is not None:
-                sends.add((channel, chat_id))
+                sends.setdefault((channel, chat_id), []).append(content)
             media_info = f" with {len(media)} attachments" if media else ""
             button_info = (
                 f" with {sum(len(row) for row in button_rows)} button(s)"

@@ -142,7 +142,8 @@ async def test_message_tool_does_not_inherit_metadata_for_cross_target() -> None
     ):
         await tool.execute(content="channel reply", channel="slack", chat_id="C999")
 
-    assert sent[0].metadata == {}
+    assert sent[0].metadata == {"_record_channel_delivery": True}
+    assert "slack" not in sent[0].metadata
 
 
 @pytest.mark.asyncio

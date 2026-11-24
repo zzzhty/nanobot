@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
+from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.image_generation_config import ImageGenerationToolConfig
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.schema import (
@@ -37,30 +38,46 @@ if TYPE_CHECKING:
     from nanobot.config.schema import Config, ProviderConfig
 
 
-@tool_parameters(
-    tool_parameters_schema(
-        prompt=StringSchema(
-            "Detailed image generation or edit instructions.",
-            min_length=1,
-        ),
-        reference_images=ArraySchema(
-            StringSchema(""),
-            description="Existing local image paths for edits, including prior generated artifacts.",
-        ),
-        aspect_ratio=StringSchema(
-            "Output aspect ratio, e.g. 1:1 or 16:9.",
-        ),
-        image_size=StringSchema(
-            "Provider-supported output size hint, e.g. 1K or 1024x1024.",
-        ),
-        count=IntegerSchema(
-            description="Number of images to generate in this turn.",
-            minimum=1,
-            maximum=8,
-        ),
-        required=["prompt"],
-    )
+_IMAGE_PARAMETERS = tool_parameters_schema(
+    prompt=StringSchema(
+        "Detailed image generation or edit instructions.",
+        min_length=1,
+    ),
+    reference_images=ArraySchema(
+        StringSchema(""),
+        description="Existing local image paths for edits, including prior generated artifacts.",
+    ),
+    aspect_ratio=StringSchema(
+        "Output aspect ratio, e.g. 1:1 or 16:9.",
+    ),
+    image_size=StringSchema(
+        "Provider-supported output size hint, e.g. 1K or 1024x1024.",
+    ),
+    count=IntegerSchema(
+        description="Number of images to generate in this turn.",
+        minimum=1,
+        maximum=8,
+    ),
+    required=["prompt"],
 )
+
+
+def _queue_parameters() -> dict[str, Any]:
+    schema = deepcopy(_IMAGE_PARAMETERS)
+    properties = schema["properties"]
+    properties["queue_mode"] = StringSchema(
+        "For the gateway queue: status to inspect drafts; merge (default) with a full updated brief; "
+        "new for a separate image; recover to read interrupted inputs; defer to hold a draft for clarification. "
+        "Only the user can unpause it, by sending /image-resume.",
+        enum=["status", "merge", "new", "recover", "defer"],
+    ).to_json_schema()
+    properties["draft_id"] = StringSchema(
+        "ID from status. A draft is edited; a frozen image may seed the next draft.",
+    ).to_json_schema()
+    schema["required"] = []
+    return schema
+
+
 class ImageGenerationTool(Tool):
     """Generate persistent image artifacts through the configured image provider."""
 
@@ -105,9 +122,26 @@ class ImageGenerationTool(Tool):
 
     @property
     def description(self) -> str:
+        if self._queue_enabled():
+            return (
+                "Queue image generation or edits for the current interactive conversation. "
+                "Use status before modifying a pending image. The gateway delivers results automatically; "
+                "do not claim completion or submit twice. Use new only for a separate request."
+            )
         return (
             "Generate or edit images as persistent artifacts. Returns artifact IDs and local paths."
         )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        if self._queue_enabled():
+            return _queue_parameters()
+        return deepcopy(_IMAGE_PARAMETERS)
+
+    def _queue_enabled(self) -> bool:
+        if os.environ.get("NANOBOT_IMAGE_QUEUE") == "1":
+            return True
+        return bool(self.config.persistent_queue)
 
     def _provider_config(self) -> ProviderConfig | None:
         return self.provider_configs.get(self.config.provider)
@@ -156,19 +190,50 @@ class ImageGenerationTool(Tool):
             raise ImageGenerationError(f"unsupported reference image: {value}")
         return str(resolved)
 
-    def _resolve_reference_images(self, values: list[str] | None) -> list[str]:
+    def resolve_reference_images(self, values: list[str] | None) -> list[str]:
         if not values:
             return []
         return [self._resolve_reference_image(value) for value in values if value]
 
     async def execute(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
-        prompt: str,
+        prompt: str | None = None,
         reference_images: list[str] | None = None,
         aspect_ratio: str | None = None,
         image_size: str | None = None,
         count: int | None = None,
+        queue_mode: str = "merge",
+        draft_id: str | None = None,
         **kwargs: Any,
+    ) -> str:
+        if self._queue_enabled():
+            from nanobot.agent.image_queue import handle_image_request
+
+            return await handle_image_request(
+                self,
+                prompt,
+                reference_images,
+                aspect_ratio,
+                image_size,
+                count,
+                queue_mode,
+                draft_id,
+            )
+        if not prompt or queue_mode not in {"merge", "new"}:
+            return ToolResult.error(
+                "Error: a prompt is required; queue controls are only available when the persistent image queue is enabled"
+            )
+        return await self.generate_now(prompt, reference_images, aspect_ratio, image_size, count)
+
+    async def generate_now(
+        self,
+        prompt: str,
+        reference_images: list[str] | None,
+        aspect_ratio: str | None,
+        image_size: str | None,
+        count: int | None,
+        *,
+        references_are_resolved: bool = False,
     ) -> str:
         client = self._provider_client()
         if client is None:
@@ -182,7 +247,11 @@ class ImageGenerationTool(Tool):
             )
 
         try:
-            refs = self._resolve_reference_images(reference_images)
+            refs = (
+                list(reference_images or [])
+                if references_are_resolved
+                else self.resolve_reference_images(reference_images)
+            )
             artifacts: list[dict[str, Any]] = []
             while len(artifacts) < requested:
                 response = await client.generate(

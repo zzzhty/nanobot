@@ -17,6 +17,10 @@ If the `generate_image` tool is not available in the current tool list, tell the
 - Ambiguous edits: ask a short clarifying question if multiple recent images could be the target.
 - After generating images, call the `message` tool with the artifact paths in the `media` parameter to deliver them to the user.
 
+## Gateway Queue
+
+Follow this section only when the `generate_image` description says the gateway queues the image. Call `queue_mode=status` before changing a draft. `merge` replaces the full brief, `new` starts a separate image, and `defer` holds the draft until the user answers. `recover` reads an interrupted input. Do not submit the same input twice. The gateway sends the finished image later; do not claim that it is finished in the current turn. `/stop` and `/new` remain commands.
+
 ## Prompt Rules
 
 Write prompts with enough detail for image models:

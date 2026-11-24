@@ -36,8 +36,17 @@ class CommandExpansion:
 
 
 def command_text(message: InboundMessage) -> str:
-    """Return routable text; command-generated agent input must not be dispatched again."""
-    return "" if message.metadata.get("original_command") else message.content.strip()
+    """Return routable text; command-generated agent input must not be dispatched again.
+
+    QQ group context is prepended to ``content``. The user's own text stays in
+    ``raw_content`` so ``/stop`` and ``/new`` are still commands.
+    """
+    if message.metadata.get("original_command"):
+        return ""
+    raw = message.metadata.get("raw_content")
+    if message.channel == "qq" and isinstance(raw, str):
+        return raw.strip()
+    return message.content.strip()
 
 
 def normalize_command_text(text: str) -> str:

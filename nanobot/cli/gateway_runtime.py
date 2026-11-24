@@ -2,7 +2,7 @@ import asyncio
 import signal
 from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from contextlib import ExitStack, suppress
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -21,8 +21,8 @@ from nanobot.agent.tools.image_generation import (
 )
 from nanobot.agent.tools.mcp import MCPProvider
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.bus.channel_delivery import deliver_to_channel as _deliver_to_channel
 from nanobot.bus.events import OutboundMessage
-from nanobot.bus.queue import MessageBus
 from nanobot.cli import terminal as cli_terminal
 from nanobot.cli.dock import watch_gateway_icon
 from nanobot.cli.runtime_config import _migrate_cron_store
@@ -45,7 +45,6 @@ from nanobot.gateway.runtime import GatewayHealthIdentity, GatewayInstance, Gate
 from nanobot.installation_lock import installation_access
 from nanobot.security.network import is_loopback_host
 from nanobot.session.keys import HEARTBEAT_SESSION_KEY
-from nanobot.session.manager import SessionManager
 from nanobot.utils.evaluator import evaluate_response, resolve_evaluator_prompt
 from nanobot.utils.helpers import sync_workspace_templates
 from nanobot.utils.token_encoding import warmup_token_encoding
@@ -61,56 +60,6 @@ if TYPE_CHECKING:
 __all__ = ["_run_gateway"]
 
 console = Console()
-
-
-async def _deliver_to_channel(
-    msg: OutboundMessage,
-    *,
-    bus: MessageBus,
-    session_manager: SessionManager,
-    record: bool = False,
-    session_key: str | None = None,
-    session_generation: str | None = None,
-) -> None:
-    metadata = dict(msg.metadata or {})
-    record = record or bool(metadata.pop("_record_channel_delivery", False))
-    raw_key = metadata.pop("_session_key", None)
-    raw_generation = metadata.pop("_session_generation", None)
-    expected_generation = (
-        session_generation
-        if session_generation is not None
-        else raw_generation if isinstance(raw_generation, str) else None
-    )
-    key = session_key or (raw_key if isinstance(raw_key, str) else None)
-    if key is None:
-        key = f"{msg.channel}:{msg.chat_id}"
-    if msg.channel == "websocket":
-        from nanobot.agent.turn_delivery import TurnRoute
-        from nanobot.session.display_history import HISTORY_GENERATION_METADATA_KEY
-        from nanobot.session.webui_turns import WebuiTurnRoutePolicy
-        from nanobot.webui.session_identity import webui_session_key
-
-        route = await WebuiTurnRoutePolicy(session_manager).admit(
-            TurnRoute(msg.channel, msg.chat_id, metadata), key, expected_generation,
-        )
-        metadata = route.metadata
-        if key == webui_session_key(msg.chat_id):
-            expected_generation = cast(str, metadata[HISTORY_GENERATION_METADATA_KEY])
-    if metadata != (msg.metadata or {}):
-        msg = replace(msg, metadata=metadata)
-    if record and msg.channel != "cli" and msg.content.strip():
-        if expected_generation is None:
-            # Cross-target sends admit their target before recording; subsequent
-            # deletion or reset must still revoke this delivery's generation.
-            target = await session_manager.state.get_header(key)
-            expected_generation = target.generation
-        extra: dict[str, Any] = {"_channel_delivery": True}
-        if msg.media:
-            extra["media"] = list(msg.media)
-        await session_manager.state.record_delivery(
-            key, msg.content, extra, expected_generation=expected_generation,
-        )
-    await bus.publish_outbound(msg)
 
 
 class _MCPReadinessHook(AgentHook):

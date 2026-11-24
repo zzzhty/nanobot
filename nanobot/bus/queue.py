@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import inspect
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
 from typing import Any, TypeVar, overload
 
 from loguru import logger
@@ -34,11 +35,15 @@ class MessageBus:
         self._handlers: list[EventHandler] = []
         self._pending: set[asyncio.Task[None]] = set()
         self.outbound_recorder: Callable[[OutboundMessage], None] | None = None
+        self.image_queue_admit: Callable[[InboundMessage], None] | None = None
 
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""
         self.admission.check()
         # This queue is unbounded. Admission and enqueue must not yield apart.
+        admit = self.image_queue_admit
+        if admit is not None:
+            admit(msg)
         self.inbound.put_nowait(msg)
 
     async def consume_inbound(self) -> InboundMessage:
@@ -47,6 +52,17 @@ class MessageBus:
 
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Queue a routed message or event for its channel."""
+        # The delivery helper consumes this marker before publish. Drop it here
+        # so a direct publish cannot store an internal flag in the outbox.
+        if "_record_channel_delivery" in msg.metadata:
+            msg = replace(
+                msg,
+                metadata={
+                    key: value
+                    for key, value in msg.metadata.items()
+                    if key != "_record_channel_delivery"
+                },
+            )
         if self.outbound_recorder is not None:
             self.outbound_recorder(msg)
         await self.outbound.put(msg)

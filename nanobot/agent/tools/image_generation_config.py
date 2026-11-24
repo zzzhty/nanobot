@@ -13,6 +13,9 @@ class ImageGenerationToolConfig(Base):
     default_aspect_ratio: str = "1:1"
     default_image_size: str = "1K"
     max_images_per_turn: int = Field(default=4, ge=1, le=8)
+    # Opt-in gateway queue. Interactive QQ and WebUI turns merge drafts and
+    # deliver finished images later; other turns keep the synchronous tool.
+    persistent_queue: bool = False
     save_dir: str = "generated"
     extra_headers: dict[str, str] | None = Field(default=None, repr=False)
     extra_body: dict[str, Any] | None = Field(default=None, repr=False)
