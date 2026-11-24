@@ -242,8 +242,9 @@ def test_group_context_rejects_symlink_and_uses_private_permissions(tmp_path: Pa
 def test_mention_gate_strips_the_bot_and_drops_other_group_text() -> None:
     mentioned = decide_group_event(
         {
-            "id": "m-at",
+            "id": "event-at",
             "d": {
+                "id": "msg-at",
                 "content": "<@!bot-a> hello",
                 "group_openid": "group-a",
                 "author": {"member_openid": "user-a"},
@@ -256,8 +257,9 @@ def test_mention_gate_strips_the_bot_and_drops_other_group_text() -> None:
     )
     plain = decide_group_event(
         {
-            "id": "m-plain-text",
+            "id": "event-plain",
             "d": {
+                "id": "msg-plain",
                 "content": "hello",
                 "group_openid": "group-a",
                 "author": {"member_openid": "user-b"},
@@ -270,7 +272,33 @@ def test_mention_gate_strips_the_bot_and_drops_other_group_text() -> None:
 
     assert mentioned.dispatch is True
     assert mentioned.content == "hello"
+    assert mentioned.message_id == "msg-at"
     assert plain.dispatch is False
+    assert plain.message_id == "msg-plain"
+
+
+def test_unmentioned_message_uses_the_body_id_not_the_event_id() -> None:
+    decision = decide_group_event(
+        {
+            "id": "event-1",
+            "d": {
+                "id": "msg-1",
+                "content": "",
+                "group_openid": "group-a",
+                "author": {"member_openid": "user-a"},
+            },
+        },
+        state=MentionState(),
+        robot_id="bot-a",
+        require_mention=False,
+    )
+
+    assert decision.dispatch is True
+    assert decision.at_bot is False
+    assert decision.message_id == "msg-1"
+    mark_plain_group_message(decision.message_id)
+    assert consume_plain_group_message("msg-1") is True
+    assert consume_plain_group_message("event-1") is False
 
 
 def test_group_parser_is_registered_in_process_without_editing_qq_botpy() -> None:

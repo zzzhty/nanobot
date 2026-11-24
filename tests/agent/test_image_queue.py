@@ -10,8 +10,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from nanobot.agent.image_queue import TOKEN_KEY, ImageQueue
+from nanobot.agent.image_queue import TOKEN_KEY, ImageQueue, Input
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.tools.context import RequestContext, request_context
 from nanobot.agent.tools.image_generation import ImageGenerationTool
 from nanobot.agent.tools.image_generation_config import ImageGenerationToolConfig
 from nanobot.bus.events import InboundMessage
@@ -136,6 +137,78 @@ async def test_cancel_drops_drafts_and_close_keeps_unknown_without_retry(
         await restarted.close()
 
 
+def test_merged_clarification_releases_the_deferred_hold(queue: ImageQueue, tmp_path: Path) -> None:
+    first = _message("draw a cat", "m-1")
+    queue.admit(first)
+    created = queue.inputs[first.metadata[TOKEN_KEY]]
+    queue.submit(created, "generation-a", _tool(tmp_path), {"prompt": "cat"}, "merge", None)
+    with queue.turn(first):
+        queue.finish(first, True)
+
+    question = _message("which color", "m-2")
+    queue.admit(question)
+    held = queue.inputs[question.metadata[TOKEN_KEY]]
+    assert queue.defer(held, "generation-a").startswith("Draft held")
+    with queue.turn(question):
+        queue.finish(question, True)
+    assert queue._candidates() == []
+
+    separate = _message("draw something else", "m-3")
+    queue.admit(separate)
+    separate_record = queue.inputs[separate.metadata[TOKEN_KEY]]
+    queue.submit(separate_record, "generation-a", _tool(tmp_path), {"prompt": "separate"}, "new", None)
+    with queue.turn(separate):
+        queue.finish(separate, True)
+    assert queue._candidates() == []
+
+    answer = _message("blue", "m-4")
+    queue.admit(answer)
+    revised = queue.inputs[answer.metadata[TOKEN_KEY]]
+    queue.submit(revised, "generation-a", _tool(tmp_path), {"prompt": "blue cat"}, "merge", None)
+    with queue.turn(answer):
+        queue.finish(answer, True)
+
+    assert [json.loads(str(row["params"]))["prompt"] for row in queue._candidates()] == ["blue cat"]
+    with queue._tx() as db:
+        remaining = [str(row["id"]) for row in db.execute("SELECT id FROM inbox")]
+    assert held.id not in remaining
+
+
+def test_unresolved_hold_survives_a_merged_draft(queue: ImageQueue, tmp_path: Path) -> None:
+    first = _message("draw a cat", "m-1")
+    queue.admit(first)
+    created = queue.inputs[first.metadata[TOKEN_KEY]]
+    queue.submit(created, "generation-a", _tool(tmp_path), {"prompt": "cat"}, "new", None)
+    with queue.turn(first):
+        queue.finish(first, True)
+    orphan = Input(
+        "orphan",
+        first.session_key,
+        "origin-orphan",
+        "qq",
+        "group-a",
+        "user-a",
+        None,
+        "generation-a",
+        "lost",
+        (),
+    )
+    with queue._tx() as db:
+        queue._hold(db, orphan, "generation-a", reason="hold")
+
+    answer = _message("blue", "m-2")
+    queue.admit(answer)
+    revised = queue.inputs[answer.metadata[TOKEN_KEY]]
+    queue.submit(revised, "generation-a", _tool(tmp_path), {"prompt": "blue cat"}, "merge", None)
+    with queue.turn(answer):
+        queue.finish(answer, True)
+
+    assert queue._candidates() == []
+    with queue._tx() as db:
+        remaining = [str(row["id"]) for row in db.execute("SELECT id FROM inbox")]
+    assert remaining == [orphan.id]
+
+
 def test_queue_file_is_private_and_symlink_root_is_rejected(tmp_path: Path) -> None:
     loop = _loop(tmp_path)
     root = tmp_path / "image-queue"
@@ -168,17 +241,60 @@ async def test_enabled_tool_queues_instead_of_calling_the_provider(
 
     tool.generate_now = _generate  # type: ignore[method-assign]
     result = await tool.execute(prompt="draw one")
+    called = False
+    status = await tool.execute(queue_mode="status")
     disabled = ImageGenerationTool(
         workspace=tmp_path,
         config=ImageGenerationToolConfig(),
     )
 
+    assert result == "{}"
     assert called is False
-    assert "interactive" in result
+    assert "interactive QQ or WebUI" in status
     assert "queue_mode" in tool.parameters["properties"]
     assert tool.parameters["required"] == []
     assert disabled.parameters["required"] == ["prompt"]
     monkeypatch.delenv("NANOBOT_IMAGE_QUEUE", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_enabled_tool_queues_only_the_interactive_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NANOBOT_IMAGE_QUEUE", raising=False)
+    loop = _loop(tmp_path)
+    queue = _queue(loop, tmp_path / "image-queue")
+    tool = ImageGenerationTool(
+        workspace=tmp_path,
+        config=ImageGenerationToolConfig(persistent_queue=True, provider="fake", model="fake-image"),
+    )
+    called = False
+
+    async def _generate(*_args: object, **_kwargs: object) -> str:
+        nonlocal called
+        called = True
+        return "{}"
+
+    tool.generate_now = _generate  # type: ignore[method-assign]
+    message = _message("draw one", "m-1")
+    queue.admit(message)
+    try:
+        with request_context(RequestContext(
+            "qq",
+            "group-a",
+            sender_id="user-a",
+            session_key=message.session_key,
+            session_generation="generation-a",
+        )):
+            with queue.turn(message):
+                result = await tool.execute(prompt="draw one")
+    finally:
+        if queue._owner.is_locked:
+            queue._owner.release()
+
+    assert called is False
+    assert "draft queued" in result
 
 
 @pytest.mark.asyncio

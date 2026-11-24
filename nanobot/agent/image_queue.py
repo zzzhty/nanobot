@@ -153,7 +153,8 @@ class ImageQueue:
                 db.execute(
                     """CREATE TABLE IF NOT EXISTS inbox (
                         id TEXT PRIMARY KEY, session TEXT NOT NULL, generation TEXT NOT NULL,
-                        payload TEXT NOT NULL, created REAL NOT NULL)"""
+                        payload TEXT NOT NULL, created REAL NOT NULL,
+                        reason TEXT NOT NULL DEFAULT 'hold')"""
                 )
                 db.execute(
                     "CREATE INDEX IF NOT EXISTS image_inbox_session ON inbox(session, generation)"
@@ -480,7 +481,7 @@ class ImageQueue:
             ).fetchone()
             if exists is None:
                 return ToolResult.error("No draft to hold for clarification.")
-            self._hold(db, record, generation)
+            self._hold(db, record, generation, reason="defer")
             self.deferred.add(record.id)
         return "Draft held. Read unresolved inputs with recover and revise before resuming."
 
@@ -519,6 +520,8 @@ class ImageQueue:
                     (record.key, generation, record.origin),
                 ).fetchone()
                 if prior is not None:
+                    if mode != "new":
+                        self._release_deferred(db, record.key, generation)
                     return json.dumps({
                         "job": str(prior["job"]),
                         "status": "already accepted; do not submit again",
@@ -610,6 +613,8 @@ class ImageQueue:
                             now,
                         ),
                     )
+                if mode != "new":
+                    self._release_deferred(db, record.key, generation)
                 for pending_id in self.by_session.get(record.key, {}):
                     pending = self.inputs[pending_id]
                     if pending.generation in (None, generation):
@@ -820,16 +825,36 @@ class ImageQueue:
                 ),
             )
 
-    def _hold(self, db: sqlite3.Connection, record: Input, generation: str) -> None:
+    def _hold(
+        self,
+        db: sqlite3.Connection,
+        record: Input,
+        generation: str,
+        *,
+        reason: str = "hold",
+    ) -> None:
         db.execute(
-            "INSERT OR IGNORE INTO inbox VALUES (?, ?, ?, ?, ?)",
+            """INSERT INTO inbox (id, session, generation, payload, created, reason)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 payload=excluded.payload,
+                 generation=excluded.generation,
+                 reason=CASE WHEN excluded.reason='defer' THEN 'defer' ELSE inbox.reason END""",
             (
                 record.id,
                 record.key,
                 generation,
                 json.dumps({"text": record.text, "media": record.media}, ensure_ascii=False),
                 self._now(),
+                reason,
             ),
+        )
+
+    def _release_deferred(self, db: sqlite3.Connection, key: str, generation: str) -> None:
+        """Drop clarification holds once a revised draft is accepted."""
+        db.execute(
+            "DELETE FROM inbox WHERE session=? AND generation=? AND reason='defer'",
+            (key, generation),
         )
 
     def _drop_input(self, record: Input) -> None:
@@ -877,6 +902,11 @@ class ImageQueue:
         os.close(fd)
         if os.name == "posix":
             os.chmod(path, 0o600)
+
+
+def interactive_queue_turn() -> bool:
+    """Whether the current turn was admitted to the QQ or WebUI image queue."""
+    return _active_record() is not None
 
 
 def _active_record() -> tuple[ImageQueue, Input] | None:

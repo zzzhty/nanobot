@@ -74,7 +74,8 @@ def decide_group_event(
     author_body = _object(body.get("author"))
     chat_id = str(body.get("group_openid") or "")
     sender_id = str(author_body.get("member_openid") or "")
-    message_id = str(payload.get("id") or "")
+    # The envelope id is the gateway event id. GroupMessage.id comes from d.id.
+    message_id = str(body.get("id") or "")
 
     own = [str(item.get("id") or "") for item in rows if item.get("is_you")]
     if not state.self_openid:

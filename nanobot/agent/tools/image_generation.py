@@ -124,9 +124,10 @@ class ImageGenerationTool(Tool):
     def description(self) -> str:
         if self._queue_enabled():
             return (
-                "Queue image generation or edits for the current interactive conversation. "
-                "Use status before modifying a pending image. The gateway delivers results automatically; "
-                "do not claim completion or submit twice. Use new only for a separate request."
+                "Queue image generation for the current interactive QQ or WebUI turn. "
+                "The gateway delivers those results later. On every other turn, generate the image immediately. "
+                "Use status before modifying a pending image. Do not claim completion or submit twice. "
+                "Use new only for a separate request."
             )
         return (
             "Generate or edit images as persistent artifacts. Returns artifact IDs and local paths."
@@ -207,18 +208,24 @@ class ImageGenerationTool(Tool):
         **kwargs: Any,
     ) -> str:
         if self._queue_enabled():
-            from nanobot.agent.image_queue import handle_image_request
+            from nanobot.agent.image_queue import handle_image_request, interactive_queue_turn
 
-            return await handle_image_request(
-                self,
-                prompt,
-                reference_images,
-                aspect_ratio,
-                image_size,
-                count,
-                queue_mode,
-                draft_id,
-            )
+            if interactive_queue_turn():
+                return await handle_image_request(
+                    self,
+                    prompt,
+                    reference_images,
+                    aspect_ratio,
+                    image_size,
+                    count,
+                    queue_mode,
+                    draft_id,
+                )
+            if queue_mode not in {"merge", "new"}:
+                return ToolResult.error(
+                    "Queued image controls require an interactive QQ or WebUI user turn. "
+                    "Other turns generate the image directly."
+                )
         if not prompt or queue_mode not in {"merge", "new"}:
             return ToolResult.error(
                 "Error: a prompt is required; queue controls are only available when the persistent image queue is enabled"
