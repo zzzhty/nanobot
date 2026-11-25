@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -228,14 +229,25 @@ async def test_send_failure_log_has_route_and_not_the_chat_id(
     assert "RuntimeError" in rendered
 
 
-def test_group_context_rejects_symlink_and_uses_private_permissions(tmp_path: Path) -> None:
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+def test_group_context_uses_private_permissions(tmp_path: Path) -> None:
     target = tmp_path / "private"
     log = GroupContextLog(target)
     assert (target.stat().st_mode & 0o777) == 0o700
     assert (log.path.stat().st_mode & 0o777) == 0o600
+
+
+def test_group_context_rejects_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "private"
+    target.mkdir()
     link = tmp_path / "linked"
-    link.symlink_to(target, target_is_directory=True)
-    with pytest.raises(OSError):
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 1314:
+            raise
+        pytest.skip("Windows runner cannot create symlinks")
+    with pytest.raises(OSError, match="QQ group context directory must not be a symlink"):
         GroupContextLog(link)
 
 
