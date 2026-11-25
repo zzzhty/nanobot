@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -209,7 +210,8 @@ def test_unresolved_hold_survives_a_merged_draft(queue: ImageQueue, tmp_path: Pa
     assert remaining == [orphan.id]
 
 
-def test_queue_file_is_private_and_symlink_root_is_rejected(tmp_path: Path) -> None:
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+def test_queue_file_is_private(tmp_path: Path) -> None:
     loop = _loop(tmp_path)
     root = tmp_path / "image-queue"
     queue = _queue(loop, root)
@@ -217,9 +219,20 @@ def test_queue_file_is_private_and_symlink_root_is_rejected(tmp_path: Path) -> N
         assert (root / "jobs.sqlite3").stat().st_mode & 0o777 == 0o600
     finally:
         queue._owner.release()
+
+
+def test_queue_rejects_symlink_root(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    root = tmp_path / "image-queue"
+    root.mkdir()
     link = tmp_path / "linked-queue"
-    link.symlink_to(root, target_is_directory=True)
-    with pytest.raises(OSError):
+    try:
+        link.symlink_to(root, target_is_directory=True)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 1314:
+            raise
+        pytest.skip("Windows runner cannot create symlinks")
+    with pytest.raises(OSError, match="image queue path must not be a symlink"):
         _queue(loop, link)
 
 

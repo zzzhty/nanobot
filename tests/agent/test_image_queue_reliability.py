@@ -22,7 +22,8 @@ from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.image_generation import ImageGenerationTool, ImageRequestRejectedError
 from nanobot.agent.tools.image_generation_config import ImageGenerationToolConfig
 from nanobot.bus.events import InboundMessage
-from tests.agent.test_image_queue import _loop, _queue, _tool
+
+from .test_image_queue import _loop, _queue, _tool
 
 
 def _message(
