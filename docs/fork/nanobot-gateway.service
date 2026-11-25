@@ -1,0 +1,30 @@
+[Unit]
+Description=Nanobot Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace these paths. Do not put this machine's secrets in the unit.
+WorkingDirectory=/path/to/home
+# Interpreter from this fork's install. Do not set PYTHONPATH to a patch checkout.
+ExecStart=/path/to/venv/bin/python -m nanobot gateway --foreground --port 18790
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+# uv tool installs have no pip. Channel dependency bootstrap needs uv on PATH.
+# Environment=PATH=/path/to/uv-bin:/usr/local/bin:/usr/bin:/bin
+# Group replies require an explicit @mention. Set to 0 to admit plain group text.
+Environment=QQ_GROUP_REQUIRE_MENTION=1
+# Slow-turn acknowledgement. 0 keeps it off. QQ_SLOW_ACK_TEXTS accepts commas or pipes.
+Environment=QQ_SLOW_ACK_SECONDS=0
+# Persistent image queue for QQ and WebUI turns that have generate_image.
+Environment=NANOBOT_IMAGE_QUEUE=1
+# Optional. Unset uses the data directory's ambient/qq_messages.db.
+# Environment=QQ_AMBIENT_DB=/path/to/data/ambient/qq_messages.db
+# Environment=QQ_AMBIENT_MEDIA_DIR=/path/to/media/qq/ambient
+# No EnvironmentFile: keys live in config.json (0600).
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

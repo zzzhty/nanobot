@@ -13,6 +13,7 @@ SETUP_SPEC = ChannelSetupSpec(
         "slowAckSeconds": field("float", default=0),
         "slowAckTexts": field("list"),
         "senderNames": field("json", default={}),
+        "botOpenid": field("string", default=""),
         "groupContextDir": field("string", default=""),
         "groupContextMinutes": field("int", default=120),
         "groupContextLimit": field("int", default=40),

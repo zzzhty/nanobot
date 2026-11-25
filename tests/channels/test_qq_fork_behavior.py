@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +10,6 @@ import pytest
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.qq.group_context import GroupContextLog
 from nanobot.channels.qq.group_events import (
     MentionState,
     consume_plain_group_message,
@@ -26,9 +24,12 @@ from nanobot.config import loader as config_loader
 
 
 @pytest.fixture
-def isolated_config(tmp_path: Path):
+def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     previous = config_loader._current_config_path
     config_loader.set_config_path(tmp_path / "config.json")
+    monkeypatch.setenv("QQ_AMBIENT_DB", str(tmp_path / "ambient" / "qq_messages.db"))
+    monkeypatch.setenv("QQ_AMBIENT_MEDIA_DIR", str(tmp_path / "ambient-media"))
+    monkeypatch.setenv("QQ_AMBIENT_SENDER_NAMES", "")
     yield
     config_loader._current_config_path = previous
 
@@ -156,12 +157,31 @@ async def test_group_context_stays_in_one_group_and_commands_stay_raw(
     tmp_path: Path,
 ) -> None:
     channel = _channel(tmp_path, group_allow_from=["group-a", "group-b"])
-    await channel._on_message(_group("group-a", "user-a", "earlier", "m-earlier"), is_group=True)
-    await channel.bus.consume_inbound()
+    from nanobot.channels.qq import ambient
+
+    ambient.log_message(
+        chat_id="group-a",
+        chat_type="group",
+        msg_id="m-earlier",
+        sender_id="user-a",
+        content="earlier",
+        at_bot=False,
+        routed=False,
+    )
+    ambient.log_message(
+        chat_id="group-a",
+        chat_type="group",
+        msg_id="m-follow",
+        sender_id="user-b",
+        content="what was that",
+        at_bot=True,
+        routed=True,
+    )
     await channel._on_message(_group("group-a", "user-b", "what was that", "m-follow"), is_group=True)
     follow = await channel.bus.consume_inbound()
     assert "earlier" in follow.content
-    assert follow.content.startswith("[最近群消息")
+    assert follow.content.startswith("[群里最近")
+    assert follow.content.count("what was that") == 1
     assert follow.metadata["raw_content"] == "what was that"
 
     await channel._on_message(_group("group-b", "user-a", "other room", "m-other-room"), is_group=True)
@@ -202,53 +222,68 @@ async def test_outbound_group_route_strips_prefix_and_retries_expired_msgid(
 
 
 @pytest.mark.asyncio
-async def test_send_failure_log_has_route_and_not_the_chat_id(
+async def test_send_logs_success_and_failure_without_signed_urls(
     isolated_config: None,
     tmp_path: Path,
 ) -> None:
     from loguru import logger
 
     channel = _channel(tmp_path)
-    channel._client = _client(_Api())
-
-    async def _boom(**_kwargs: object) -> None:
-        raise RuntimeError("transport failed")
-
-    channel._client.api.post_c2c_message = _boom
+    api = _Api()
+    channel._client = _client(api)
     messages: list[str] = []
     sink = logger.add(lambda message: messages.append(str(message)), format="{message}")
     try:
+        await channel.send(
+            OutboundMessage(
+                channel="qq",
+                chat_id="user-a",
+                content="hello",
+                metadata={"message_id": "m-ok"},
+            )
+        )
+        signed = "https://signed.example/file?sig=secret-token"
+
+        async def _boom(**_kwargs: object) -> None:
+            raise RuntimeError(f"transport failed code=40034031 {signed}")
+
+        channel._client.api.post_c2c_message = _boom
         with pytest.raises(RuntimeError):
-            await channel.send(OutboundMessage(channel="qq", chat_id="user-a", content="hello"))
+            await channel.send(
+                OutboundMessage(
+                    channel="qq",
+                    chat_id="user-a",
+                    content="hello",
+                    metadata={"message_id": "m-bad"},
+                )
+            )
     finally:
         logger.remove(sink)
 
     rendered = "\n".join(messages)
-    assert "user-a" not in rendered
-    assert "route=c2c" in rendered
-    assert "RuntimeError" in rendered
+    assert "QQ send ok route=c2c target=user-a msgid=m-ok length=5" in rendered
+    assert "QQ send failed route=c2c target=user-a msgid=m-bad length=5 error=RuntimeError code=40034031" in rendered
+    assert signed not in rendered
+    assert "err=" not in rendered
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
-def test_group_context_uses_private_permissions(tmp_path: Path) -> None:
-    target = tmp_path / "private"
-    log = GroupContextLog(target)
-    assert (target.stat().st_mode & 0o777) == 0o700
-    assert (log.path.stat().st_mode & 0o777) == 0o600
+def test_slow_ack_texts_accept_commas_and_pipes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("QQ_SLOW_ACK_SECONDS", "3")
+    monkeypatch.setenv("QQ_SLOW_ACK_TEXTS", "收到, 稍等|马上")
+    channel = _channel(tmp_path)
+    assert channel._slow_ack_metadata() == {
+        "slow_ack_seconds": 3.0,
+        "slow_ack_texts": ["收到", "稍等", "马上"],
+    }
+    monkeypatch.setenv("QQ_SLOW_ACK_SECONDS", "0")
+    assert channel._slow_ack_metadata() == {}
 
 
-def test_group_context_rejects_symlink(tmp_path: Path) -> None:
-    target = tmp_path / "private"
-    target.mkdir()
-    link = tmp_path / "linked"
-    try:
-        link.symlink_to(target, target_is_directory=True)
-    except OSError as exc:
-        if getattr(exc, "winerror", None) != 1314:
-            raise
-        pytest.skip("Windows runner cannot create symlinks")
-    with pytest.raises(OSError, match="QQ group context directory must not be a symlink"):
-        GroupContextLog(link)
+def test_bot_openid_is_not_an_allowlist(tmp_path: Path) -> None:
+    channel = _channel(tmp_path, bot_openid="bot-self", allow_from=["user-a"])
+    assert channel.config.bot_openid == "bot-self"
+    assert "bot-self" not in channel._group_allow_tokens()
+    assert channel.is_allowed("bot-self") is False
 
 
 def test_mention_gate_strips_the_bot_and_drops_other_group_text() -> None:

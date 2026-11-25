@@ -29,6 +29,7 @@ export default {
         { key: "channels.qq.slowAckTexts", section: "behavior" },
         { key: "channels.qq.httpTimeout", section: "advanced" },
         { key: "channels.qq.senderNames", section: "advanced" },
+        { key: "channels.qq.botOpenid", section: "advanced" },
         { key: "channels.qq.groupContextDir", section: "advanced" },
         { key: "channels.qq.groupContextMinutes", section: "advanced" },
         { key: "channels.qq.groupContextLimit", section: "advanced" },

@@ -42,11 +42,11 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.outbound_events import ContextCompactionEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.channels.qq.group_context import GroupContextEntry, GroupContextLog
 from nanobot.channels.qq.group_events import (
     GroupEventDecision,
     consume_plain_group_message,
     install_group_message_parser,
+    install_unknown_event_logger,
 )
 from nanobot.config_base import Base
 from nanobot.security.network import validate_url_target
@@ -126,6 +126,28 @@ def _msgid_expired(exc: BaseException) -> bool:
         return True
     lowered = text.lower()
     return "过期" in text or "expired" in lowered
+
+
+_QQ_CODE_RE = re.compile(r"(?:\"code\"|'code'|\bcode)\s*[:=]\s*(\d+)", re.IGNORECASE)
+_QQ_BARE_CODE_RE = re.compile(r"\b(\d{5,8})\b")
+
+
+def _qq_error_code(exc: BaseException) -> str:
+    """Return a numeric QQ error code without the exception text or URL."""
+    for name in ("code", "error_code", "retcode"):
+        value = getattr(exc, name, None)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, str) and value.isdigit():
+            return value
+    text = str(exc)
+    match = _QQ_CODE_RE.search(text)
+    if match:
+        return match.group(1)
+    match = _QQ_BARE_CODE_RE.search(text)
+    return match.group(1) if match else ""
 
 
 _EMPTY_MENTION = "[有人只 @ 了你，没有写其他文字]"
@@ -313,6 +335,11 @@ class QQConfig(Base):
     slow_ack_seconds: float = 0
     slow_ack_texts: list[str] = Field(default_factory=list)
     sender_names: dict[str, str] = Field(default_factory=dict)
+    # Member openid of this bot. Ambient transcripts label it with
+    # agents.defaults.botName. It is not an allowlist.
+    bot_openid: str = ""
+    # Not the transcript archive. Rows live in ambient/qq_messages.db.
+    # Kept so older configs still load; do not point it at that database.
     group_context_dir: str = ""
     group_context_minutes: int = 120
     group_context_limit: int = 40
@@ -356,8 +383,6 @@ class QQChannel(BaseChannel):
         self._msg_seq: int = 1  # used to avoid QQ API dedup
         self._chat_type_cache: dict[str, str] = {}
         self._known_group_ids: set[str] = set()
-        self._group_context: GroupContextLog | None = None
-        self._group_context_disabled = False
 
         _install_qq_payload_capture()
 
@@ -424,7 +449,7 @@ class QQChannel(BaseChannel):
         texts = [text.strip() for text in self.config.slow_ack_texts if text.strip()]
         raw_texts = os.environ.get("QQ_SLOW_ACK_TEXTS")
         if raw_texts:
-            texts = [part.strip() for part in raw_texts.split("|") if part.strip()]
+            texts = [part.strip() for part in re.split(r"[|,]", raw_texts) if part.strip()]
         if seconds <= 0 or not texts:
             return {}
         return {"slow_ack_seconds": seconds, "slow_ack_texts": texts}
@@ -435,81 +460,44 @@ class QQChannel(BaseChannel):
             return False
         return "*" in groups or chat_id in groups
 
-    def _context_log(self) -> GroupContextLog | None:
-        if self._group_context_disabled:
-            return None
-        if self._group_context is not None:
-            return self._group_context
-        try:
-            if self.config.group_context_dir:
-                root = Path(self.config.group_context_dir).expanduser()
-            else:
-                from nanobot.config.paths import get_data_dir
-
-                root = get_data_dir() / "qq-group-context"
-            self._group_context = GroupContextLog(
-                root,
-                minutes=self.config.group_context_minutes,
-                limit=self.config.group_context_limit,
-                sender_names=self.config.sender_names,
-            )
-        except OSError:
-            self._group_context_disabled = True
-            self.logger.warning("QQ group context is unavailable")
-            return None
-        return self._group_context
-
-    def _remember_ambient_group_message(self, decision: GroupEventDecision) -> None:
+    def _remember_seen_group(self, decision: GroupEventDecision) -> None:
+        """Let ``*`` learn a group from an unmentioned message. Does not archive."""
         if decision.dispatch or not decision.chat_id or not self._context_enabled_for(decision.chat_id):
             return
         self._known_group_ids.add(decision.chat_id)
-        self._record_group_line(
-            decision.chat_id,
-            decision.message_id,
-            decision.sender_id,
-            decision.raw_content,
-            at_bot=decision.at_bot,
-            attachment_count=decision.attachment_count,
-        )
 
-    def _record_group_line(
-        self,
-        chat_id: str,
-        message_id: str,
-        sender_id: str,
-        content: str,
-        *,
-        at_bot: bool,
-        attachment_count: int,
-    ) -> None:
-        log = self._context_log()
-        if log is None:
-            return
-        try:
-            log.record(
-                GroupContextEntry(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    sender_id=sender_id,
-                    content=content,
-                    at_bot=at_bot,
-                    created=log.clock(),
-                    attachment_count=attachment_count,
-                )
-            )
-        except Exception:
-            self.logger.debug("QQ group context record failed")
+    def _ambient_window(self) -> tuple[int, int]:
+        minutes = self.config.group_context_minutes
+        limit = self.config.group_context_limit
+        raw_minutes = os.environ.get("QQ_AMBIENT_CONTEXT_MINUTES")
+        raw_limit = os.environ.get("QQ_AMBIENT_CONTEXT_LIMIT")
+        if raw_minutes:
+            try:
+                minutes = int(raw_minutes)
+            except ValueError:
+                pass
+        if raw_limit:
+            try:
+                limit = int(raw_limit)
+            except ValueError:
+                pass
+        return minutes, limit
 
     def _prepend_group_context(self, chat_id: str, message_id: str, content: str) -> str:
         if content.startswith("/"):
             return content
-        log = self._context_log()
-        if log is None:
-            return content
         try:
-            block = log.context_block(chat_id, exclude_message_id=message_id)
+            from nanobot.channels.qq import ambient
+
+            minutes, limit = self._ambient_window()
+            block = ambient.context_block(
+                chat_id=chat_id,
+                exclude_msg_id=message_id,
+                minutes=minutes,
+                limit=limit,
+            )
         except Exception:
-            self.logger.debug("QQ group context read failed")
+            self.logger.debug("QQ ambient context read failed")
             return content
         if not block:
             return content
@@ -552,9 +540,10 @@ class QQChannel(BaseChannel):
         self._http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
         if QQ_AVAILABLE:
             install_group_message_parser(
-                self._remember_ambient_group_message,
+                self._remember_seen_group,
                 require_mention=self._mention_required,
             )
+            install_unknown_event_logger()
 
         self._client = _make_bot_class(self)()
         self.logger.info("bot started (C2C & Group supported)")
@@ -605,8 +594,6 @@ class QQChannel(BaseChannel):
             return
 
         chat_id, is_group = self._outbound_target(msg.chat_id)
-        route = "group" if is_group else "c2c"
-        length = len((msg.content or "").strip())
         raw_id = msg.metadata.get("message_id")
         msg_id = raw_id if isinstance(raw_id, str) and raw_id else None
         try:
@@ -616,14 +603,6 @@ class QQChannel(BaseChannel):
                 self.logger.info("QQ reply window expired; retrying without message id")
                 await self._deliver(chat_id, is_group, None, msg)
                 return
-            if isinstance(exc, (aiohttp.ClientError, OSError)):
-                raise
-            self.logger.error(
-                "QQ send failed route={} length={} error={}",
-                route,
-                length,
-                type(exc).__name__,
-            )
             raise
 
     async def _deliver(
@@ -686,10 +665,30 @@ class QQChannel(BaseChannel):
         else:
             payload["content"] = content
 
-        if is_group:
-            await self._client.api.post_group_message(group_openid=chat_id, **payload)
-        else:
-            await self._client.api.post_c2c_message(openid=chat_id, **payload)
+        route = "group" if is_group else "c2c"
+        try:
+            if is_group:
+                await self._client.api.post_group_message(group_openid=chat_id, **payload)
+            else:
+                await self._client.api.post_c2c_message(openid=chat_id, **payload)
+        except Exception as exc:
+            self.logger.warning(
+                "QQ send failed route={} target={} msgid={} length={} error={} code={}",
+                route,
+                chat_id,
+                msg_id or "",
+                len(content or ""),
+                type(exc).__name__,
+                _qq_error_code(exc),
+            )
+            raise
+        self.logger.info(
+            "QQ send ok route={} target={} msgid={} length={}",
+            route,
+            chat_id,
+            msg_id or "",
+            len(content or ""),
+        )
 
     async def _send_media(
         self,
@@ -738,15 +737,35 @@ class QQChannel(BaseChannel):
                     media=media_obj,
                 )
 
-            self.logger.info("media sent: {}", filename)
+            self.logger.info(
+                "QQ send ok route={} target={} msgid={} length={}",
+                "group" if is_group else "c2c",
+                chat_id,
+                msg_id or "",
+                0,
+            )
             return True
-        except (aiohttp.ClientError, OSError) as e:
-            # Network / transport errors — propagate for retry by caller
-            self.logger.warning("send media network error filename={} err={}", filename, e)
+        except (aiohttp.ClientError, OSError) as exc:
+            self.logger.warning(
+                "QQ send failed route={} target={} msgid={} length={} error={} code={}",
+                "group" if is_group else "c2c",
+                chat_id,
+                msg_id or "",
+                0,
+                type(exc).__name__,
+                _qq_error_code(exc),
+            )
             raise
-        except Exception:
-            # API-level or other non-network errors — return False so send() can fallback
-            self.logger.exception("send media failed filename={}", filename)
+        except Exception as exc:
+            self.logger.warning(
+                "QQ send failed route={} target={} msgid={} length={} error={} code={}",
+                "group" if is_group else "c2c",
+                chat_id,
+                msg_id or "",
+                0,
+                type(exc).__name__,
+                _qq_error_code(exc),
+            )
             return False
 
     async def _read_media_bytes(self, media_ref: str) -> tuple[bytes | None, str | None]:
@@ -923,16 +942,8 @@ class QQChannel(BaseChannel):
                 return
 
             raw_content = content
-            if is_group and self._context_enabled_for(chat_id):
+            if is_group:
                 content = self._prepend_group_context(chat_id, message_id, content)
-                self._record_group_line(
-                    chat_id,
-                    message_id,
-                    user_id,
-                    raw_content,
-                    at_bot=True,
-                    attachment_count=len(attachments),
-                )
 
             if self.config.ack_message:
                 try:

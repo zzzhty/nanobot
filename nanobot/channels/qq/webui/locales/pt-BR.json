@@ -28,6 +28,7 @@
       "slowAckSeconds": { "label": "Atraso do recibo lento (s)" },
       "slowAckTexts": { "label": "Textos do recibo lento" },
       "senderNames": { "label": "Nomes dos membros" },
+      "botOpenid": { "label": "OpenID do bot" },
       "groupContextDir": { "label": "Pasta de contexto do grupo" },
       "groupContextMinutes": { "label": "Janela de contexto (min)" },
       "groupContextLimit": { "label": "Limite de mensagens de contexto" },

@@ -151,7 +151,15 @@ def test_slow_ack_is_group_only_and_queued_images_are_not_injected(tmp_path: Pat
         metadata={"message_id": "m-image", "raw_content": "see", "chat_type": "group"},
     )
     text = InboundMessage(channel="qq", sender_id="user-a", chat_id="group-a", content="next")
-    assert loop._can_inject_message(image) is True
+    assert loop._can_inject_message(image) is False
+    document = InboundMessage(
+        channel="qq",
+        sender_id="user-a",
+        chat_id="group-a",
+        content="file",
+        media=[str(tmp_path / "notes.pdf")],
+    )
+    assert loop._can_inject_message(document) is True
     queue = ImageQueue(loop, tmp_path / "image-queue", clock=lambda: 1_000.0, debounce=0)
     loop._image_queue = queue
     try:

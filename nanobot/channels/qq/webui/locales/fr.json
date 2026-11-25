@@ -28,6 +28,7 @@
       "slowAckSeconds": { "label": "Délai de l'accusé lent (s)" },
       "slowAckTexts": { "label": "Textes de l'accusé lent" },
       "senderNames": { "label": "Noms des membres" },
+      "botOpenid": { "label": "OpenID du bot" },
       "groupContextDir": { "label": "Dossier de contexte du groupe" },
       "groupContextMinutes": { "label": "Fenêtre de contexte (min)" },
       "groupContextLimit": { "label": "Limite de messages de contexte" },

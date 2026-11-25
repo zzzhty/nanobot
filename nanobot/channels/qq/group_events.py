@@ -10,6 +10,8 @@ out of the agent; mention tokens are removed before dispatch.
 
 from __future__ import annotations
 
+import inspect
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
@@ -121,6 +123,10 @@ _mention_state = MentionState()
 _installed = False
 _plain_order: list[str] = []
 _plain_ids: set[str] = set()
+_REDACTED_FIELDS = ("id", "group_openid", "group_id", "content", "timestamp", "message_type")
+_AUTHOR_FIELDS = ("id", "member_openid", "user_openid", "username", "bot")
+_REDACTED_LIMIT = 1200
+_LIBRARY_REDACTION_MARKERS = ("group_openid", "member_openid", "user_openid")
 
 
 def mark_plain_group_message(message_id: str) -> None:
@@ -142,6 +148,108 @@ def consume_plain_group_message(message_id: str) -> bool:
 
 
 def _require_mention() -> bool:
+    return True
+
+
+def archive_group_event(payload: Mapping[str, Any], decision: GroupEventDecision) -> None:
+    """Record one group event after the mention decision. Never raises.
+
+    New rows store ``decision.message_id``, which is ``d.id`` and the same
+    value as ``GroupMessage.id``. The gateway envelope id is not stored.
+    Undispatched attachments are downloaded; dispatched ones stay on the
+    normal inbound path.
+    """
+    try:
+        from nanobot.channels.qq import ambient
+
+        body = _object(payload.get("d"))
+        attachments = body.get("attachments")
+        wrote = ambient.log_message(
+            chat_id=decision.chat_id,
+            chat_type="group",
+            msg_id=decision.message_id,
+            sender_id=decision.sender_id,
+            content=decision.raw_content,
+            at_bot=decision.at_bot,
+            routed=decision.dispatch,
+            mentions=body.get("mentions"),
+            attachments=attachments,
+        )
+        if wrote and not decision.dispatch and attachments:
+            ambient.queue_download(
+                chat_id=decision.chat_id,
+                msg_id=decision.message_id,
+                attachments=attachments,
+            )
+    except Exception:
+        logger.debug("QQ ambient archive failed")
+
+
+def redacted_event_text(payload: Mapping[str, Any]) -> str:
+    """Whitelist fields from an unknown-event body, truncated to 1200 characters."""
+    data = _object(payload.get("d"))
+    safe: dict[str, Any] = {key: data[key] for key in _REDACTED_FIELDS if key in data}
+    author = _object(data.get("author"))
+    if author:
+        safe["author"] = {key: author[key] for key in _AUTHOR_FIELDS if key in author}
+    safe["keys"] = sorted(data)
+    return str(safe)[:_REDACTED_LIMIT]
+
+
+def _library_already_redacts(method: Callable[..., object]) -> bool:
+    try:
+        source = inspect.getsource(cast(Any, method))
+    except (OSError, TypeError):
+        return False
+    return all(token in source for token in _LIBRARY_REDACTION_MARKERS)
+
+
+def _log_unknown_event(owner: object, message: object) -> None:
+    raw = message.decode("utf-8", "replace") if isinstance(message, bytes) else message
+    if not isinstance(raw, str):
+        return
+    parsed: object = json.loads(raw)
+    body = _object(parsed)
+    event = body.get("t")
+    if not isinstance(event, str) or body.get("op") != getattr(owner, "WS_DISPATCH_EVENT", 0):
+        return
+    name = event.lower()
+    parser = getattr(owner, "_parser", None)
+    if isinstance(parser, Mapping) and name in parser:
+        return
+    logger.error("QQ unknown event {} payload (redacted): {}", name, redacted_event_text(body))
+
+
+def install_unknown_event_logger(target: type | None = None) -> bool:
+    """Log a redacted payload for unknown gateway events. Idempotent.
+
+    Does not edit installed files, does not replace ``parse_*`` methods, and
+    does not wrap a library method that already logs the same whitelist.
+    """
+    cls = target
+    if cls is None:
+        try:
+            from botpy.gateway import BotWebSocket
+        except ImportError:
+            return False
+        cls = BotWebSocket
+    current = getattr(cls, "on_message", None)
+    if current is None:
+        return False
+    if getattr(current, "_nanobot_redacted_event_log", False):
+        return True
+    if target is None and _library_already_redacts(current):
+        return False
+
+    async def on_message(self: Any, ws: object, message: object) -> object:
+        try:
+            _log_unknown_event(self, message)
+        except Exception:
+            logger.debug("QQ unknown event log failed")
+        return await current(self, ws, message)
+
+    on_message._nanobot_redacted_event_log = True  # type: ignore[attr-defined]
+    cls.on_message = on_message  # type: ignore[method-assign]
     return True
 
 
@@ -188,6 +296,7 @@ def _parse_group_message_create(self: Any, payload: Mapping[str, Any]) -> None:
         robot_id=robot_id,
         require_mention=_require_mention(),
     )
+    archive_group_event(payload, decision)
     if not decision.dispatch:
         if _handler is not None:
             _handler(decision)

@@ -1,3 +1,4 @@
+import os
 from typing import Literal
 
 from nanobot.bus.outbound_events import (
@@ -38,6 +39,12 @@ def notification_is_deliverable(
     event_type: type[AgentEvent], *, channel: str, publish_lifecycle: bool,
 ) -> bool:
     """Admit operation notifications to a channel only by explicit policy."""
+    if event_type is ContextCompactionEvent:
+        # Unset mutes qq. An explicit empty string does not add this mute.
+        muted = os.environ.get("NANOBOT_COMPACTION_NOTICE_MUTE", "qq")
+        names = {part.strip() for part in muted.split(",") if part.strip()}
+        if channel in names:
+            return False
     audience = NOTIFICATION_AUDIENCES.get(event_type)
     if audience is None:
         return False
