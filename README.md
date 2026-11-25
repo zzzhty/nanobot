@@ -33,12 +33,12 @@ QQ 的最终答复只在本回合、同一目标、正常完成、且文本与 `
 
 ### 安装本 fork
 
-克隆 <https://github.com/zzzhty/nanobot.git>，检出包含本段说明的提交。合并到该仓库 `main` 之前，集成分支是 `cursor/integrate-qq-fork-patches-eb96`。合并之后改用 `main` 上的合并提交，并把提交号固定下来。
+克隆 <https://github.com/zzzhty/nanobot.git>，使用 `main` 上的 `8a8abc408a2234516481bf9faf306dab212cfc77`。这是包含旁路归档的提交。生产替换顺序在 [`docs/fork/cutover.md`](./docs/fork/cutover.md)，维护窗口之前不要停正在跑的网关。
 
 ```bash
 git clone https://github.com/zzzhty/nanobot.git
 cd nanobot
-git checkout cursor/integrate-qq-fork-patches-eb96
+git checkout 8a8abc408a2234516481bf9faf306dab212cfc77
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
@@ -63,7 +63,7 @@ python -m pip install "nanobot-ai @ git+https://github.com/zzzhty/nanobot.git@<c
 
 未知事件除了库自己的事件名日志之外，本进程再记一份脱敏载荷：只保留白名单字段和键名，截断到 1200 字符，不记录 token、secret 或完整原始包。安装文件不会被改写。如果库自己已经记录同等脱敏载荷，本进程不再包第二层。
 
-可提交的部署模板在 [`docs/fork/`](./docs/fork/)。网关单元没有 `ExecStartPre`，也不把补丁仓库放进 `PYTHONPATH`。巡检检查旁路库、归档模块和进程内解析器，不以 site-packages 里的补丁标记为成功标准。升级演练安装本 fork 的固定提交，而不是官方 wheel 加补丁脚本。
+可提交的部署模板在 [`docs/fork/`](./docs/fork/)。网关单元没有 `ExecStartPre`，也不把补丁仓库放进 `PYTHONPATH`。巡检检查旁路库、归档模块和进程内解析器，不以 site-packages 里的补丁标记为成功标准。升级演练安装本 fork 的固定提交，而不是官方 wheel 加补丁脚本。从当前补丁部署换过来的顺序在 [`docs/fork/cutover.md`](./docs/fork/cutover.md)。
 
 ### 升级与回归
 
