@@ -29,9 +29,6 @@
       "slowAckTexts": { "label": "느린 수신 문구" },
       "senderNames": { "label": "멤버 표시 이름" },
       "botOpenid": { "label": "봇 OpenID" },
-      "groupContextDir": { "label": "그룹 문맥 디렉터리" },
-      "groupContextMinutes": { "label": "문맥 창(분)" },
-      "groupContextLimit": { "label": "문맥 개수" },
       "msgFormat": {
         "label": "메시지 형식",
         "choices": {

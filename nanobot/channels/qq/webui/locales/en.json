@@ -29,9 +29,6 @@
       "slowAckTexts": { "label": "Slow receipt texts" },
       "senderNames": { "label": "Member display names" },
       "botOpenid": { "label": "Bot OpenID" },
-      "groupContextDir": { "label": "Group context directory" },
-      "groupContextMinutes": { "label": "Context window (minutes)" },
-      "groupContextLimit": { "label": "Context message limit" },
       "msgFormat": {
         "label": "Message format",
         "choices": {

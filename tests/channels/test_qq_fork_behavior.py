@@ -58,7 +58,6 @@ def _channel(tmp_path: Path, **overrides: object) -> QQChannel:
         "app_id": "app",
         "secret": "secret",
         "ack_message": "",
-        "group_context_dir": str(tmp_path / "group-context"),
     }
     config.update(overrides)
     return QQChannel(QQConfig(**config), MessageBus())  # type: ignore[arg-type]

@@ -6,8 +6,7 @@ never raise. Callers store ``d.id`` — the same id as ``GroupMessage.id`` —
 not the gateway envelope id. Old rows are left as they were written.
 
 The database defaults to the data directory's ``ambient/qq_messages.db``
-(``QQ_AMBIENT_DB`` overrides it). This module does not read
-``groupContextDir`` and does not import the external patch repository.
+(``QQ_AMBIENT_DB`` overrides it).
 """
 
 from __future__ import annotations

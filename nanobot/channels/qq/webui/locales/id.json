@@ -29,9 +29,6 @@
       "slowAckTexts": { "label": "Teks tanda terima lambat" },
       "senderNames": { "label": "Nama tampilan anggota" },
       "botOpenid": { "label": "OpenID bot" },
-      "groupContextDir": { "label": "Folder konteks grup" },
-      "groupContextMinutes": { "label": "Jendela konteks (menit)" },
-      "groupContextLimit": { "label": "Batas pesan konteks" },
       "msgFormat": {
         "label": "Format pesan",
         "choices": {

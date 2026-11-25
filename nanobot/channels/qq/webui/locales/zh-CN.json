@@ -29,9 +29,6 @@
       "slowAckTexts": { "label": "慢回执文案" },
       "senderNames": { "label": "成员显示名" },
       "botOpenid": { "label": "机器人 OpenID" },
-      "groupContextDir": { "label": "群上下文目录" },
-      "groupContextMinutes": { "label": "上下文窗口（分钟）" },
-      "groupContextLimit": { "label": "上下文条数" },
       "msgFormat": {
         "label": "消息格式",
         "choices": {

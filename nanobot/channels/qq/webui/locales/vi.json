@@ -29,9 +29,6 @@
       "slowAckTexts": { "label": "Nội dung biên nhận chậm" },
       "senderNames": { "label": "Tên hiển thị thành viên" },
       "botOpenid": { "label": "OpenID bot" },
-      "groupContextDir": { "label": "Thư mục ngữ cảnh nhóm" },
-      "groupContextMinutes": { "label": "Cửa sổ ngữ cảnh (phút)" },
-      "groupContextLimit": { "label": "Giới hạn tin ngữ cảnh" },
       "msgFormat": {
         "label": "Định dạng tin nhắn",
         "choices": {

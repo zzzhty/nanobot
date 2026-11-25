@@ -15,7 +15,7 @@ QQ 群消息会在进程内补上 qq-botpy 1.2.x 没有的 `parse_group_message_
 
 `channels.qq.groupAllowFrom` 按群授权。群本身在名单里、发消息的人却不在 `allowFrom` 里时，这一次授权使用群的 chat id。发消息的人已经在 `allowFrom` 里时，授权方式与官方一致。`"*"` 只放行本进程已经见过的群，不放行私聊。把某个具体群 id 写进名单后，`is_allowed` 会把这个 id 当成已授权；如果私聊碰巧使用同一个 id，也会被当成已授权。
 
-每条入站群消息都会在提及判断之后写入数据目录下的 `ambient/qq_messages.db`，包括未 @、未派发和不在回复名单里的群。可用 `QQ_AMBIENT_DB` 改路径。未识别的群 id 不写入。库大约保留 30 天，可用 `QQ_AMBIENT_RETENTION_DAYS` 修改。@ 回复注入最近 120 分钟、最多 40 条旁路记录，可用 `QQ_AMBIENT_CONTEXT_MINUTES`、`QQ_AMBIENT_CONTEXT_LIMIT`，或 `channels.qq.groupContextMinutes` / `groupContextLimit` 修改；环境变量优先。纯附件消息会渲染成带文字的一行，例如 `[图片 1 张]`。未 @ 的附件下载到媒体目录 `qq/ambient`，可用 `QQ_AMBIENT_MEDIA_DIR` 覆盖；已派发的附件仍只走原来的入站下载。以 `/` 开头的文本不会被上下文挡住，`/stop` 和 `/new` 读取 QQ 消息的原文。只有 @、没有其他文字时，进入会话的内容是 `[有人只 @ 了你，没有写其他文字]`。未 @ 的消息不会进入 agent。私聊的空消息仍按官方逻辑丢弃。`channels.qq.groupContextDir` 不是这份归档，不要把它指到旁路库。显示名来自 `channels.qq.senderNames`、`channels.qq.botOpenid` 对应的 `agents.defaults.botName`，或 `QQ_AMBIENT_SENDER_NAMES`。`botOpenid` 不是授权名单。命令行是 `python -m nanobot.channels.qq.ambient`。
+每条入站群消息都会在提及判断之后写入数据目录下的 `ambient/qq_messages.db`，包括未 @、未派发和不在回复名单里的群。可用 `QQ_AMBIENT_DB` 改路径。未识别的群 id 不写入。库大约保留 30 天，可用 `QQ_AMBIENT_RETENTION_DAYS` 修改。@ 回复注入最近 120 分钟、最多 40 条旁路记录，可用 `QQ_AMBIENT_CONTEXT_MINUTES` 和 `QQ_AMBIENT_CONTEXT_LIMIT` 修改。纯附件消息会渲染成带文字的一行，例如 `[图片 1 张]`。未 @ 的附件下载到媒体目录 `qq/ambient`，可用 `QQ_AMBIENT_MEDIA_DIR` 覆盖；已派发的附件仍只走原来的入站下载。以 `/` 开头的文本不会被上下文挡住，`/stop` 和 `/new` 读取 QQ 消息的原文。只有 @、没有其他文字时，进入会话的内容是 `[有人只 @ 了你，没有写其他文字]`。未 @ 的消息不会进入 agent。私聊的空消息仍按官方逻辑丢弃。显示名来自 `channels.qq.senderNames`、`channels.qq.botOpenid` 对应的 `agents.defaults.botName`，或 `QQ_AMBIENT_SENDER_NAMES`。`botOpenid` 不是授权名单。命令行是 `python -m nanobot.channels.qq.ambient`。
 
 出站会去掉开头的 `qq:` 前缀。已经见过的会话按群或私聊发送；还没见过、但 id 明确写在 `groupAllowFrom` 里的目标按群发送，避免定时消息打到私聊接口后 404。`"*"` 不能单独把未知 id 判成群。缓存里的私聊优先于名单。QQ HTTP 超时默认 60 秒，可用 `channels.qq.httpTimeout` 或 `QQ_HTTP_TIMEOUT` 修改。引用的 msgid 过期时会去掉 msgid 再发一次。发送成功和失败都会记日志，字段是路由、目标、msgid、长度，失败时再加上异常类型和 QQ 错误码。日志不写异常原文，也不写 API 返回体。
 
@@ -33,12 +33,12 @@ QQ 的最终答复只在本回合、同一目标、正常完成、且文本与 `
 
 ### 安装本 fork
 
-克隆 <https://github.com/zzzhty/nanobot.git>，使用 `main` 上的 `8a8abc408a2234516481bf9faf306dab212cfc77`。这是包含旁路归档的提交。生产替换顺序在 [`docs/fork/cutover.md`](./docs/fork/cutover.md)，维护窗口之前不要停正在跑的网关。
+克隆 <https://github.com/zzzhty/nanobot.git>，使用 `main`。当前部署说明在 [`docs/fork/cutover.md`](./docs/fork/cutover.md)。
 
 ```bash
 git clone https://github.com/zzzhty/nanobot.git
 cd nanobot
-git checkout 8a8abc408a2234516481bf9faf306dab212cfc77
+git checkout main
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
@@ -63,7 +63,7 @@ python -m pip install "nanobot-ai @ git+https://github.com/zzzhty/nanobot.git@<c
 
 未知事件除了库自己的事件名日志之外，本进程再记一份脱敏载荷：只保留白名单字段和键名，截断到 1200 字符，不记录 token、secret 或完整原始包。安装文件不会被改写。如果库自己已经记录同等脱敏载荷，本进程不再包第二层。
 
-可提交的部署模板在 [`docs/fork/`](./docs/fork/)。网关单元没有 `ExecStartPre`，也不把补丁仓库放进 `PYTHONPATH`。巡检检查旁路库、归档模块和进程内解析器，不以 site-packages 里的补丁标记为成功标准。升级演练安装本 fork 的固定提交，而不是官方 wheel 加补丁脚本。从当前补丁部署换过来的顺序在 [`docs/fork/cutover.md`](./docs/fork/cutover.md)。
+可提交的部署模板在 [`docs/fork/`](./docs/fork/)。网关单元没有 `ExecStartPre`，也不把补丁仓库放进 `PYTHONPATH`。巡检检查旁路库、归档模块和进程内解析器，不以 site-packages 里的补丁标记为成功标准。升级安装本 fork 的 `main`，而不是官方 wheel 加补丁脚本。当前部署见 [`docs/fork/cutover.md`](./docs/fork/cutover.md)。
 
 ### 升级与回归
 

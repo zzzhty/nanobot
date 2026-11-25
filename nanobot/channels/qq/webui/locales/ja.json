@@ -29,9 +29,6 @@
       "slowAckTexts": { "label": "遅い受領の文面" },
       "senderNames": { "label": "メンバー表示名" },
       "botOpenid": { "label": "ボット OpenID" },
-      "groupContextDir": { "label": "グループ文脈の保存先" },
-      "groupContextMinutes": { "label": "文脈の窓（分）" },
-      "groupContextLimit": { "label": "文脈の件数" },
       "msgFormat": {
         "label": "メッセージ形式",
         "choices": {

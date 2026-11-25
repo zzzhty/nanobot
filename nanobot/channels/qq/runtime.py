@@ -338,11 +338,6 @@ class QQConfig(Base):
     # Member openid of this bot. Ambient transcripts label it with
     # agents.defaults.botName. It is not an allowlist.
     bot_openid: str = ""
-    # Not the transcript archive. Rows live in ambient/qq_messages.db.
-    # Kept so older configs still load; do not point it at that database.
-    group_context_dir: str = ""
-    group_context_minutes: int = 120
-    group_context_limit: int = 40
     ack_message: str = "⏳ Processing..."
 
     # Optional: directory to save inbound attachments. If empty, use nanobot get_media_dir("qq").
@@ -466,35 +461,15 @@ class QQChannel(BaseChannel):
             return
         self._known_group_ids.add(decision.chat_id)
 
-    def _ambient_window(self) -> tuple[int, int]:
-        minutes = self.config.group_context_minutes
-        limit = self.config.group_context_limit
-        raw_minutes = os.environ.get("QQ_AMBIENT_CONTEXT_MINUTES")
-        raw_limit = os.environ.get("QQ_AMBIENT_CONTEXT_LIMIT")
-        if raw_minutes:
-            try:
-                minutes = int(raw_minutes)
-            except ValueError:
-                pass
-        if raw_limit:
-            try:
-                limit = int(raw_limit)
-            except ValueError:
-                pass
-        return minutes, limit
-
     def _prepend_group_context(self, chat_id: str, message_id: str, content: str) -> str:
         if content.startswith("/"):
             return content
         try:
             from nanobot.channels.qq import ambient
 
-            minutes, limit = self._ambient_window()
             block = ambient.context_block(
                 chat_id=chat_id,
                 exclude_msg_id=message_id,
-                minutes=minutes,
-                limit=limit,
             )
         except Exception:
             self.logger.debug("QQ ambient context read failed")
