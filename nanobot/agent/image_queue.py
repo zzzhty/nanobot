@@ -61,6 +61,18 @@ DELIVERY_TIMEOUT = 30.0
 WATCH_EXTEND = 300.0
 _BACKGROUND_GRACE = 1.0
 _IMAGE_CHOICES = {"/image-wait", "/image-retry"}
+# These channels keep image follow-ups on their own turn so this queue can
+# admit them. Other channels keep upstream mid-turn image injection.
+_QUEUE_CHANNELS = frozenset({"qq", "websocket"})
+
+
+def image_followup_stays_separate(msg: InboundMessage) -> bool:
+    """Return whether a QQ or WebUI image follow-up must run as its own turn."""
+    if msg.channel not in _QUEUE_CHANNELS or not msg.media:
+        return False
+    from nanobot.utils.document import is_image_file
+
+    return any(is_image_file(path) for path in msg.media)
 
 
 def _as_object(value: object) -> dict[str, Any] | None:
@@ -390,7 +402,7 @@ class ImageQueue:
         text = raw_text if isinstance(raw_text, str) else command_text(msg)
         stripped = text.strip()
         if (
-            msg.channel not in {"qq", "websocket"}
+            msg.channel not in _QUEUE_CHANNELS
             or not msg.is_user_input
             or msg.sender_id == "subagent"
             or meta.get(INBOUND_META_RUNTIME_CONTROL)
@@ -515,7 +527,7 @@ class ImageQueue:
 
     async def intercept(self, msg: InboundMessage, key: str) -> bool:
         """Handle /image-resume, and keep raw /stop and /new visible as commands."""
-        if not msg.is_user_input or msg.channel not in {"qq", "websocket"} or not key.startswith(msg.channel + ":"):
+        if not msg.is_user_input or msg.channel not in _QUEUE_CHANNELS or not key.startswith(msg.channel + ":"):
             return False
         raw = msg.metadata.get("raw_content") if msg.channel == "qq" else None
         command = (raw if isinstance(raw, str) else command_text(msg)).strip().lower()

@@ -24,7 +24,7 @@ from nanobot.agent.context import ContextBuilder, PersistedPromptContextResolver
 from nanobot.agent.cron_turns import CronTurnCoordinator
 from nanobot.agent.execution_policy import ExecutionControlError, ExecutionPolicy, ExecutionScope
 from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
-from nanobot.agent.image_queue import ImageQueue
+from nanobot.agent.image_queue import ImageQueue, image_followup_stays_separate
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.model_runtime import ModelRuntimeResolver
 from nanobot.agent.pending_inputs import PendingInputs
@@ -1010,11 +1010,8 @@ class AgentLoop:
         self._file_state_store.discard(key)
 
     def _can_inject_message(self, msg: InboundMessage) -> bool:
-        if msg.media:
-            from nanobot.utils.document import is_image_file
-
-            if any(is_image_file(path) for path in msg.media):
-                return False
+        if image_followup_stays_separate(msg):
+            return False
         if turn_continuation.internal_continuation_inbound(msg.metadata) or any(
             coordinator.owns_turn(msg) for coordinator in self._automation_turn_coordinators
         ):
