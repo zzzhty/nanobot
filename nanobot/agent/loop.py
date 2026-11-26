@@ -1010,7 +1010,8 @@ class AgentLoop:
         self._file_state_store.discard(key)
 
     def _can_inject_message(self, msg: InboundMessage) -> bool:
-        if msg.media:
+        # QQ images keep their own turn even without the persistent queue.
+        if msg.channel == "qq" and msg.media:
             from nanobot.utils.document import is_image_file
 
             if any(is_image_file(path) for path in msg.media):

@@ -43,6 +43,7 @@ jobs:
           tests/agent/test_image_queue.py
           tests/agent/test_image_queue_reliability.py
           tests/agent/test_loop_image_generation_media.py
+          tests/agent/test_runner_injections.py::test_loop_injected_followup_preserves_image_media
           tests/agent/test_qq_fork_behavior.py
           tests/channels/test_qq_fork_behavior.py
           tests/tools/test_message_tool.py
