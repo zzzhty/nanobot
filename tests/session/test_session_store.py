@@ -1,4 +1,5 @@
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timedelta, timezone
 
 from nanobot.providers.base import ProviderConversationState
 from nanobot.providers.model_options import ModelOptions
@@ -9,6 +10,25 @@ from nanobot.session.model_selection import (
     SessionModelPreset,
 )
 from nanobot.session.types import PARENT_SESSION_KEY, SESSION_TYPE_KEY
+
+
+def test_offset_session_timestamp_loads_comparable_with_local_now(tmp_path):
+    manager = SessionManager(tmp_path)
+    manager.save(Session(key="cli:offset", messages=[{"role": "user", "content": "switch"}]))
+    aware = datetime(2026, 11, 26, 14, 52, 0, 629342, tzinfo=timezone(timedelta(hours=8)))
+    with sqlite3.connect(manager.sessions_dir / "sessions.sqlite3") as db:
+        db.execute(
+            "UPDATE sessions SET updated_at=? WHERE key=?",
+            (aware.isoformat(), "cli:offset"),
+        )
+
+    loaded = manager._store.load("cli:offset")
+
+    assert loaded is not None
+    assert loaded.updated_at.tzinfo is None
+    assert loaded.updated_at == aware.astimezone().replace(tzinfo=None)
+    now = datetime.now()
+    assert max(loaded.updated_at, now) in {loaded.updated_at, now}
 
 
 def test_manager_roundtrips_full_history_and_private_state(tmp_path):

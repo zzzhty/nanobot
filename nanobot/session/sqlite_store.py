@@ -32,6 +32,20 @@ _CHECKPOINT = "runtime_checkpoint"
 _INPUTS = ("pending_user_followups",)
 _T = TypeVar("_T")
 
+
+def parse_session_timestamp(value: str) -> datetime:
+    """Return a session clock time comparable with ``datetime.now()``.
+
+    Persisted rows are naive local times. An offset-aware value, such as one
+    written outside the session owner, is converted to that same local clock
+    before it can break a later save or restore comparison.
+    """
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        return parsed
+    return parsed.astimezone().replace(tzinfo=None)
+
+
 # The expression below defines the v6 partial index and must stay stable for upgrades.
 _SUBAGENT_ORIGIN = "origin_turn_id"
 _SUBAGENT_PARENT = f"json_extract(metadata, '$.{PARENT_SESSION_KEY}')"
@@ -338,8 +352,8 @@ class SqliteSessionStore:
                 messages=[_object(item[0]) for item in db.execute(
                     "SELECT record FROM messages WHERE session_key=? ORDER BY position", (key,),
                 )] if history else [],
-                created_at=datetime.fromisoformat(row["created_at"]),
-                updated_at=datetime.fromisoformat(row["updated_at"]),
+                created_at=parse_session_timestamp(row["created_at"]),
+                updated_at=parse_session_timestamp(row["updated_at"]),
                 metadata=self._metadata(db, key, row["metadata"]),
                 last_consolidated=row["last_archived"],
                 provider_state=ProviderConversationState.from_private_record(
@@ -561,8 +575,8 @@ class SqliteSessionStore:
             ).fetchone()
             if row is None:
                 return None
-            return {"key": key, "created_at": datetime.fromisoformat(row[0]).isoformat(),
-                    "updated_at": datetime.fromisoformat(row[1]).isoformat(),
+            return {"key": key, "created_at": parse_session_timestamp(row[0]).isoformat(),
+                    "updated_at": parse_session_timestamp(row[1]).isoformat(),
                     "metadata": _object(row[2]), "generation": row[3]}
 
     def project_session_messages(

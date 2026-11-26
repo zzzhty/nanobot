@@ -150,6 +150,19 @@ class ModelRuntimeResolver:
             self._model_presets = dict(self._preset_catalog_loader())
         self._preset_catalog_refresh_required = False
 
+    def _reload_missing_preset_catalog(self) -> bool:
+        """Read the preset file when a switch names a preset the cache has not seen.
+
+        Config edits can land before the file watcher invalidates this process.
+        One reload lets that switch resolve the new preset instead of failing closed.
+        """
+        if self._preset_catalog_loader is None:
+            return False
+        self._model_presets = dict(self._preset_catalog_loader())
+        self._preset_catalog_refresh_required = False
+        self._resolved_presets.clear()
+        return True
+
     def resolve_snapshot(
         self,
         snapshot: ProviderSnapshot,
@@ -185,7 +198,12 @@ class ModelRuntimeResolver:
     def resolve_preset(self, name: str | None) -> LLMRuntime:
         """Resolve a named preset without changing the selected default."""
         self._refresh_preset_catalog()
-        normalized = preset_helpers.normalize_preset_name(name, self._model_presets)
+        try:
+            normalized = preset_helpers.normalize_preset_name(name, self._model_presets)
+        except preset_helpers.UnknownModelPresetError:
+            if not self._reload_missing_preset_catalog():
+                raise
+            normalized = preset_helpers.normalize_preset_name(name, self._model_presets)
         cached = self._resolved_presets.get(normalized)
         if cached is not None:
             return cached

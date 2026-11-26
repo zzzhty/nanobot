@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from nanobot.agent.model_presets import UnknownModelPresetError
 from nanobot.agent.model_runtime import ModelRuntimeResolver
 from nanobot.config.schema import ModelPresetConfig
 from nanobot.providers.base import GenerationSettings
@@ -169,6 +170,43 @@ def test_resolver_refreshes_preset_catalog_after_invalidation() -> None:
 
     assert resolver.admit().model_preset == "new"
     assert set(resolver.model_presets) == {"new"}
+
+
+def test_resolve_preset_reloads_catalog_when_the_name_was_just_added() -> None:
+    provider = _provider()
+    catalog = {"old": ModelPresetConfig(model="old-model", provider="openai")}
+    loads = 0
+
+    def load_catalog() -> dict[str, ModelPresetConfig]:
+        nonlocal loads
+        loads += 1
+        return catalog
+
+    def load_preset(name: str) -> ProviderSnapshot:
+        preset = catalog[name]
+        return ProviderSnapshot(
+            provider=provider,
+            model=preset.model,
+            context_window_tokens=preset.context_window_tokens,
+            signature=(preset.model, preset.provider),
+            model_preset=name,
+        )
+
+    resolver = ModelRuntimeResolver(
+        runtime_from_provider_snapshot(load_preset("old")),
+        model_presets=dict(catalog),
+        preset_catalog_loader=load_catalog,
+        preset_snapshot_loader=load_preset,
+    )
+    catalog["grok-fast"] = ModelPresetConfig(model="grok-4.7-build-fast", provider="xai_grok")
+
+    runtime = resolver.resolve_preset("grok-fast")
+
+    assert (runtime.model, runtime.model_preset) == ("grok-4.7-build-fast", "grok-fast")
+    assert loads == 1
+    with pytest.raises(UnknownModelPresetError):
+        resolver.resolve_preset("missing")
+    assert loads == 2
 
 
 def test_resolver_model_presets_are_read_only() -> None:
