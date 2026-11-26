@@ -1087,7 +1087,13 @@ class ImageQueue:
             self.decision.clear()
             waiter = asyncio.create_task(self.decision.wait())
             try:
-                await asyncio.wait({call, waiter}, timeout=min(max(remaining, 0.0), 1.0))
+                # The provider task stays pending, so ALL_COMPLETED would ignore
+                # decision.set() until the wall-clock poll.
+                await asyncio.wait(
+                    {call, waiter},
+                    timeout=min(max(remaining, 0.0), 1.0),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
             finally:
                 waiter.cancel()
                 with suppress(asyncio.CancelledError):

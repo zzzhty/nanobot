@@ -821,7 +821,9 @@ async def test_prompt_delivery_failure_is_recorded(tmp_path: Path, monkeypatch: 
         _submit(queue, "one", "m-1", tool, generation)
         await _until(lambda: tool.calls == ["one"])
         await _nudge(queue, clock, 180)
-        await _until(lambda: _rows(queue.root)[0]["prompt_error"] == 1, timeout=3)
+        # decision.set() has to interrupt the watch. Waiting out the one-second
+        # poll missed this on a loaded Windows runner.
+        await _until(lambda: _rows(queue.root)[0]["prompt_error"] == 1, timeout=0.5)
         assert _rows(queue.root)[0]["state"] == "running"
         assert tool.calls == ["one"]
         assert await queue.intercept(_command("/image-wait", generation), "qq:group-a") is True
