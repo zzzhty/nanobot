@@ -160,6 +160,22 @@ def test_slow_ack_is_group_only_and_queued_images_are_not_injected(tmp_path: Pat
         media=[str(tmp_path / "notes.pdf")],
     )
     assert loop._can_inject_message(document) is True
+    cli_image = InboundMessage(
+        channel="cli",
+        sender_id="u",
+        chat_id="c",
+        content="",
+        media=[str(tmp_path / "picture.png")],
+    )
+    webui_image = InboundMessage(
+        channel="websocket",
+        sender_id="user-a",
+        chat_id="web-a",
+        content="see",
+        media=[str(tmp_path / "picture.png")],
+    )
+    assert loop._can_inject_message(cli_image) is True
+    assert loop._can_inject_message(webui_image) is False
     queue = ImageQueue(loop, tmp_path / "image-queue", clock=lambda: 1_000.0, debounce=0)
     loop._image_queue = queue
     try:
