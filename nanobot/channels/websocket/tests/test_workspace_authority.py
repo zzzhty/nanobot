@@ -1,7 +1,7 @@
 """Exercise credential authority from real loopback handshakes through file tools."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import pytest
 
@@ -19,6 +19,10 @@ from nanobot.webui.workspaces import write_webui_default_access_mode
 
 from .ws_test_client import WsTestClient
 
+# Startup includes real history migration and durable SQLite writes. Allow for
+# contention on Windows workers without relaxing command or permission deadlines.
+_GATEWAY_STARTUP_TIMEOUT_S = 30.0
+
 
 @asynccontextmanager
 async def _running_gateway(tmp_path, *, restricted=True, surface="browser"):
@@ -33,25 +37,46 @@ async def _running_gateway(tmp_path, *, restricted=True, surface="browser"):
         "enabled": True, "allowFrom": ["*"], "host": "127.0.0.1", "port": 0,
         "path": "/ws", "websocketRequiresToken": True,
     })
+    sessions = SessionManager(tmp_path / "sessions")
     gateway = build_gateway_services(
         config=cfg, bus=bus, config_path=tmp_path / "config.json",
-        session_manager=SessionManager(tmp_path / "sessions"),
+        session_manager=sessions,
         static_dist_path=None, workspace_path=workspace, default_restrict_to_workspace=restricted,
         runtime_model_name=None, runtime_surface=surface, runtime_capabilities_overrides=None,
     )
     channel = WebSocketChannel(cfg.model_dump(by_alias=True), bus, gateway=gateway)
     task = asyncio.create_task(channel.start())
     try:
-        async with asyncio.timeout(5):
-            while channel._server is None:
+        async with asyncio.timeout(_GATEWAY_STARTUP_TIMEOUT_S):
+            while True:
                 if task.done():
                     await task
+                    raise AssertionError("WebSocket listener stopped before becoming ready")
+                server = channel._server
+                if (
+                    channel.is_running and server is not None
+                    and server.is_serving() and server.sockets
+                ):
+                    break
                 await asyncio.sleep(0.01)
-        port = channel._server.sockets[0].getsockname()[1]
+        port = server.sockets[0].getsockname()[1]
         yield channel, f"ws://127.0.0.1:{port}/ws", workspace, project, bus
     finally:
-        await channel.stop()
-        await task
+        # stop() has no listener task to stop during history initialization.
+        # Cancel our outer task first so it cannot start a listener after stop().
+        if not channel.is_running:
+            task.cancel()
+        try:
+            await channel.stop()
+        except BaseException:
+            task.cancel()
+            raise
+        finally:
+            try:
+                with suppress(asyncio.CancelledError):
+                    await task
+            finally:
+                await sessions.state.aclose()
 
 
 async def _result(client, event):
